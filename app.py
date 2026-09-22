@@ -1,241 +1,1105 @@
+import sys
 from pathlib import Path
-import sqlite3
 import pandas as pd
 import streamlit as st
 
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from db import connect, init_db
+from ingest import ingest_report
+
 try:
     import plotly.express as px
-    PLOTLY = True
+    PLOTLY_OK = True
 except Exception:
-    PLOTLY = False
+    PLOTLY_OK = False
 
-st.set_page_config(page_title='Amazon Ops Analytics Pro', page_icon='📊', layout='wide')
+st.set_page_config(
+    page_title="Amazon Ops Analytics Pro",
+    page_icon="📊",
+    layout="wide"
+)
 
-st.markdown('''<style>
-.stApp{background:#f6f8fb}.hero{background:linear-gradient(135deg,#14213d,#263f68);padding:28px 32px;border-radius:0 0 22px 22px;color:#fff;margin:-1rem -1rem 22px;box-shadow:0 8px 25px #0002}.hero h1{margin:0;font-size:34px}.hero p{margin:7px 0 0;color:#cbd5e1}.kpi{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:18px;min-height:105px;box-shadow:0 3px 12px #0000000b}.kl{font-size:13px;color:#64748b}.kv{font-size:27px;font-weight:800;color:#172033;margin-top:8px}.kn{font-size:12px;color:#94a3b8;margin-top:4px}.stDataFrame{border-radius:12px}
-</style>''', unsafe_allow_html=True)
+init_db()
 
-ROOT=Path(__file__).resolve().parents[1]
+st.markdown("""
+<style>
+.block-container{padding-top:1.2rem}
+.hero{padding:22px 26px;border-radius:16px;background:linear-gradient(135deg,#111827,#26354d);color:white;margin-bottom:20px}
+.hero h1{margin:0;font-size:34px}.hero p{margin:6px 0 0;opacity:.82}
+.kpi{border:1px solid #e5e7eb;border-radius:14px;padding:16px;background:white;min-height:105px}
+.kpi-label{font-size:13px;color:#6b7280}.kpi-value{font-size:27px;font-weight:700;margin-top:5px}.kpi-note{font-size:12px;color:#6b7280}
+</style>
+""", unsafe_allow_html=True)
 
-def find_db():
-    candidates=[ROOT/'db'/'amazon_ops.db',ROOT/'db'/'ops.db',ROOT/'db'/'database.db',ROOT/'data'/'amazon_ops.db',ROOT/'data'/'ops.db',ROOT/'data'/'database.db',ROOT/'database.db']
-    for p in candidates:
-        if p.exists(): return p
-    for d in [ROOT/'db',ROOT/'data']:
-        if d.exists():
-            x=list(d.glob('*.db'))+list(d.glob('*.sqlite'))+list(d.glob('*.sqlite3'))
-            if x:return x[0]
+
+def qdf(sql, params=None):
+    con = connect()
+    try:
+        return pd.read_sql_query(sql, con, params=params or [])
+    finally:
+        con.close()
+
+
+def scalar(sql, params=None):
+    con = connect()
+    try:
+        row = con.execute(sql, params or []).fetchone()
+        return row[0] if row and row[0] is not None else 0
+    finally:
+        con.close()
+
+
+def cols(table):
+    con = connect()
+    try:
+        return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+    finally:
+        con.close()
+
+
+# Cancelled orders are retained in the database for audit,
+# but excluded from sales analytics.
+ACTIVE = """
+COALESCE(LOWER(TRIM(o.order_status)), '') NOT LIKE '%cancel%'
+"""
+
+
+def find_column(table, candidates):
+    available = cols(table)
+    lower_map = {c.lower(): c for c in available}
+
+    for candidate in candidates:
+        if candidate.lower() in lower_map:
+            return lower_map[candidate.lower()]
+
     return None
 
-DB=find_db()
-if not DB:
-    st.error('Database not found. Put your SQLite database in db/ or data/.')
-    st.stop()
-con=sqlite3.connect(str(DB),check_same_thread=False)
 
-def tables():
-    return pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'",con)['name'].tolist()
-TABLES=tables()
+def summary():
+    rev = scalar(f"""
+        SELECT COALESCE(
+            SUM(COALESCE(oi.item_price,0)), 0
+        )
+        FROM order_items oi
+        JOIN orders o ON o.order_id = oi.order_id
+        WHERE {ACTIVE}
+    """)
 
-def cols(t):
-    if t not in TABLES:return []
-    return pd.read_sql_query(f'PRAGMA table_info("{t}")',con)['name'].tolist()
+    orders = scalar(f"""
+        SELECT COUNT(DISTINCT o.order_id)
+        FROM orders o
+        WHERE {ACTIVE}
+    """)
 
-def col(t,*names):
-    m={x.lower():x for x in cols(t)}
-    for n in names:
-        if n.lower() in m:return m[n.lower()]
-    return None
+    units = scalar(f"""
+        SELECT COALESCE(SUM(oi.quantity),0)
+        FROM order_items oi
+        JOIN orders o ON o.order_id = oi.order_id
+        WHERE {ACTIVE}
+    """)
 
-def q(sql,params=None):
-    try:return pd.read_sql_query(sql,con,params=params or [])
-    except Exception as e:
-        st.warning(str(e));return pd.DataFrame()
+    returns = scalar("""
+        SELECT COALESCE(SUM(quantity),0)
+        FROM returns
+    """)
 
-def n(x):
-    try:return float(x or 0)
-    except:return 0.0
+    return float(rev), int(orders), int(units), int(returns)
 
-def qi(x):return '"'+x.replace('"','""')+'"'
 
-OT='orders' if 'orders' in TABLES else None
-RT='returns' if 'returns' in TABLES else None
-A=col('orders','asin','item_asin') if OT else None
-S=col('orders','sku','merchant_sku','seller_sku') if OT else None
-OID=col('orders','order_id','amazon_order_id') if OT else None
-OD=col('orders','order_date','purchase_date','purchase-date') if OT else None
-Q=col('orders','quantity','qty','item_quantity') if OT else None
-PRICE=col('orders','item_price','price','sale_price','sales_price','amount') if OT else None
-TAX=col('orders','item_tax','tax','sales_tax') if OT else None
-CITY=col('orders','ship_city','city') if OT else None
-STATE=col('orders','ship_state','state') if OT else None
-PIN=col('orders','ship_postal_code','ship-postal-code','postal_code','pincode','pin_code') if OT else None
-STATUS=col('orders','status','order_status','order_status_code') if OT else None
-PRODUCT=col('orders','product_name','item_name','title','product_title') if OT else None
-CATEGORY=col('orders','category','product_type','item_category') if OT else None
-RA=col('returns','asin','item_asin') if RT else None
-ROID=col('returns','order_id','amazon_order_id') if RT else None
-RQ=col('returns','return_quantity','quantity','qty') if RT else None
-RR=col('returns','return_reason','reason','return_reason_code') if RT else None
-RDATE=col('returns','return_date','return-date','return_creation_date','return_creation_timestamp','return_date_time','return_request_date','authorization_date','return_delivery_date','date') if RT else None
+def sales_daily():
+    return qdf(f"""
+        SELECT
+            o.order_date,
+            COUNT(DISTINCT o.order_id) AS orders,
+            SUM(oi.quantity) AS units,
+            SUM(COALESCE(oi.item_price,0)) AS revenue
+        FROM orders o
+        JOIN order_items oi ON o.order_id = oi.order_id
+        WHERE {ACTIVE}
+        GROUP BY o.order_date
+        ORDER BY o.order_date
+    """)
 
-# Cancelled orders are excluded from ALL sales calculations.
-def valid(alias='o'):
-    if not STATUS:return '1=1'
-    c=f'{alias}.{qi(STATUS)}'
-    return f"LOWER(COALESCE({c},'')) NOT LIKE '%cancel%'"
 
-def daily():
-    if not OT or not OD:return pd.DataFrame()
-    price=f'COALESCE(CAST(o.{qi(PRICE)} AS REAL),0)' if PRICE else '0'
-    qty=f'COALESCE(CAST(o.{qi(Q)} AS REAL),1)' if Q else '1'
-    oid=f'o.{qi(OID)}' if OID else 'rowid'
-    return q(f'''SELECT DATE(o.{qi(OD)}) order_date,SUM({price}) revenue,SUM({qty}) units,COUNT(DISTINCT {oid}) orders FROM orders o WHERE {valid()} GROUP BY DATE(o.{qi(OD)}) ORDER BY order_date''')
+def asin_sales():
+    return qdf(f"""
+        SELECT
+            oi.asin,
+            oi.sku,
+            SUM(oi.quantity) AS units,
+            SUM(COALESCE(oi.item_price,0)) AS revenue
+        FROM order_items oi
+        JOIN orders o ON o.order_id = oi.order_id
+        WHERE {ACTIVE}
+        GROUP BY oi.asin, oi.sku
+        ORDER BY revenue DESC
+    """)
 
-def top_asins(limit=30):
-    if not OT or not A:return pd.DataFrame()
-    price=f'COALESCE(CAST(o.{qi(PRICE)} AS REAL),0)' if PRICE else '0';qty=f'COALESCE(CAST(o.{qi(Q)} AS REAL),1)' if Q else '1'
-    return q(f'''SELECT o.{qi(A)} asin,SUM({qty}) units,SUM({price}) revenue FROM orders o WHERE {valid()} AND TRIM(COALESCE(o.{qi(A)},''))<>'' GROUP BY o.{qi(A)} ORDER BY revenue DESC LIMIT {limit}''')
 
-def returns_by_reason(limit=30):
-    if not RT or not RR:return pd.DataFrame()
-    qty=f'COALESCE(CAST(r.{qi(RQ)} AS REAL),1)' if RQ else '1'
-    return q(f'''SELECT COALESCE(NULLIF(TRIM(r.{qi(RR)}),''),'Unknown') reason,SUM({qty}) returns FROM returns r GROUP BY reason ORDER BY returns DESC LIMIT {limit}''')
+def return_asin():
+    return qdf("""
+        SELECT
+            asin,
+            sku,
+            SUM(quantity) AS return_units
+        FROM returns
+        GROUP BY asin, sku
+        ORDER BY SUM(quantity) DESC
+    """)
 
-def returns_by_location(cname,limit=30):
-    if not RT or not OT or not cname or not ROID or not OID:return pd.DataFrame()
-    qty=f'COALESCE(CAST(r.{qi(RQ)} AS REAL),1)' if RQ else '1'
-    return q(f'''SELECT COALESCE(NULLIF(TRIM(o.{qi(cname)}),''),'Unknown') location,SUM({qty}) returns FROM returns r JOIN orders o ON o.{qi(OID)}=r.{qi(ROID)} WHERE {valid()} GROUP BY location ORDER BY returns DESC LIMIT {limit}''')
 
-def return_asins(limit=30):
-    if not RT:return pd.DataFrame()
-    qty=f'COALESCE(CAST(r.{qi(RQ)} AS REAL),1)' if RQ else '1'
-    if RA:
-        return q(f'''SELECT r.{qi(RA)} asin,SUM({qty}) returns FROM returns r GROUP BY r.{qi(RA)} ORDER BY returns DESC LIMIT {limit}''')
-    if ROID and OID and A:
-        return q(f'''SELECT o.{qi(A)} asin,SUM({qty}) returns FROM returns r JOIN orders o ON o.{qi(OID)}=r.{qi(ROID)} WHERE {valid()} GROUP BY o.{qi(A)} ORDER BY returns DESC LIMIT {limit}''')
-    return pd.DataFrame()
+def return_reasons():
+    if "reason" not in cols("returns"):
+        return pd.DataFrame()
 
-def asin_profile(asin):
-    out={'units':0,'orders':0,'revenue':0,'returns':0}
-    if OT and A:
-        price=f'COALESCE(CAST(o.{qi(PRICE)} AS REAL),0)' if PRICE else '0';qty=f'COALESCE(CAST(o.{qi(Q)} AS REAL),1)' if Q else '1';oid=f'o.{qi(OID)}' if OID else 'rowid'
-        extra=[]
-        if S:extra.append(f'MAX(o.{qi(S)}) sku')
-        if PRODUCT:extra.append(f'MAX(o.{qi(PRODUCT)}) product_name')
-        if CATEGORY:extra.append(f'MAX(o.{qi(CATEGORY)}) category')
-        x=','+','.join(extra) if extra else ''
-        d=q(f'''SELECT SUM({qty}) units,SUM({price}) revenue,COUNT(DISTINCT {oid}) orders{x} FROM orders o WHERE o.{qi(A)}=? AND {valid()}''',[asin])
-        if not d.empty:out.update(d.iloc[0].to_dict())
-    if RT:
-        qty=f'COALESCE(CAST(r.{qi(RQ)} AS REAL),1)' if RQ else '1'
-        if RA:d=q(f'''SELECT SUM({qty}) returns FROM returns r WHERE r.{qi(RA)}=?''',[asin])
-        elif ROID and OID and A:d=q(f'''SELECT SUM({qty}) returns FROM returns r JOIN orders o ON o.{qi(OID)}=r.{qi(ROID)} WHERE o.{qi(A)}=? AND {valid()}''',[asin])
-        else:d=pd.DataFrame()
-        if not d.empty:out['returns']=n(d.iloc[0]['returns'])
-    out['units']=n(out['units']);out['revenue']=n(out['revenue']);out['orders']=int(n(out['orders']));out['returns']=n(out['returns']);out['return_rate']=out['returns']/out['units']*100 if out['units'] else 0
-    return out
+    return qdf("""
+        SELECT
+            COALESCE(NULLIF(TRIM(reason),''),'Unknown') AS reason,
+            SUM(quantity) AS return_units
+        FROM returns
+        GROUP BY COALESCE(NULLIF(TRIM(reason),''),'Unknown')
+        ORDER BY SUM(quantity) DESC
+    """)
 
-def asin_reasons(asin):
-    if not RT or not RR:return pd.DataFrame()
-    qty=f'COALESCE(CAST(r.{qi(RQ)} AS REAL),1)' if RQ else '1'
-    if RA:return q(f'''SELECT COALESCE(NULLIF(TRIM(r.{qi(RR)}),''),'Unknown') reason,SUM({qty}) returns FROM returns r WHERE r.{qi(RA)}=? GROUP BY reason ORDER BY returns DESC''',[asin])
-    if ROID and OID and A:return q(f'''SELECT COALESCE(NULLIF(TRIM(r.{qi(RR)}),''),'Unknown') reason,SUM({qty}) returns FROM returns r JOIN orders o ON o.{qi(OID)}=r.{qi(ROID)} WHERE o.{qi(A)}=? AND {valid()} GROUP BY reason ORDER BY returns DESC''',[asin])
-    return pd.DataFrame()
 
-d=sales_daily();revenue=n(d.revenue.sum()) if not d.empty else 0;units=n(d.units.sum()) if not d.empty else 0;orders=int(d.orders.sum()) if not d.empty else 0
-rd=return_asins(10000);return_units=n(rd.returns.sum()) if not rd.empty else 0;rate=return_units/units*100 if units else 0
+def locations():
+    """
+    Return hotspots using the shipping fields imported from the Amazon
+    order report: ship-city and ship-postal-code.
+    """
+    oc = cols("orders")
 
-st.markdown('<div class="hero"><h1>Amazon Ops Analytics Pro</h1><p>Sales intelligence • Return intelligence • ASIN performance • Location analysis</p></div>',unsafe_allow_html=True)
-st.sidebar.title('Amazon Ops')
-st.sidebar.caption('Operations Intelligence')
-page=st.sidebar.radio('Module',['Executive Dashboard','🔎 ASIN Search','📈 Sales Intelligence','↩️ Return Intelligence','📍 Location Intelligence','🎯 ASIN Scorecard','📤 Upload Center','🛠️ Data Audit'])
-st.sidebar.divider();st.sidebar.caption(f'Database: {DB.name}')
+    pc = find_column(
+        "orders",
+        [
+            "ship_postal_code",
+            "ship_pincode",
+            "ship_pin_code",
+            "postal_code",
+            "pincode",
+            "pin_code",
+            "zip"
+        ]
+    )
 
-def k(label,value,note):st.markdown(f'<div class="kpi"><div class="kl">{label}</div><div class="kv">{value}</div><div class="kn">{note}</div></div>',unsafe_allow_html=True)
+    city_col = find_column(
+        "orders",
+        ["ship_city", "shipping_city", "city"]
+    )
 
-if page=='Executive Dashboard':
-    st.subheader('Executive Overview');c=st.columns(5)
-    for x,label,value,note in zip(c,['Revenue','Valid Orders','Units Sold','Return Units','Return Rate'],[f'₹{revenue:,.0f}',f'{orders:,}',f'{units:,.0f}',f'{return_units:,.0f}',f'{rate:.2f}%'],['Non-cancelled orders','Cancelled excluded','Non-cancelled orders','Imported returns','Returns ÷ sold units']):
-        with x:k(label,value,note)
-    st.subheader('Sales Trend')
-    if not d.empty:
-        if PLOTLY:
-            fig=px.line(d,x='order_date',y='revenue',markers=True,title='Daily Revenue');fig.update_layout(height=390,margin=dict(l=20,r=20,t=55,b=20));st.plotly_chart(fig,use_container_width=True)
-        else:st.line_chart(d.set_index('order_date').revenue)
-    c1,c2=st.columns(2)
-    with c1:
-        st.subheader('Top ASIN Performance');a=top_asins(20);st.dataframe(a,use_container_width=True,hide_index=True)
-        if PLOTLY and not a.empty:st.plotly_chart(px.bar(a.sort_values('revenue'),x='revenue',y='asin',orientation='h',title='Revenue by ASIN'),use_container_width=True)
-    with c2:
-        st.subheader('Top Returned ASINs');st.dataframe(rd.head(20),use_container_width=True,hide_index=True)
-        if PLOTLY and not rd.empty:st.plotly_chart(px.bar(rd.head(15).sort_values('returns'),x='returns',y='asin',orientation='h',title='Return Units'),use_container_width=True)
+    if not pc:
+        return pd.DataFrame(), None
 
-elif page=='🔎 ASIN Search':
-    st.subheader('🔎 ASIN Search & Product Analysis');st.caption('Search an ASIN for sales, return, reason and location intelligence.')
-    asin=st.text_input('Enter ASIN',placeholder='B0XXXXXXXX').strip().upper()
-    if asin:
-        p=asin_profile(asin);c=st.columns(5)
-        vals=[(f'{p["units"]:,.0f}','Units Sold','Valid orders'),(f'{p["orders"]:,}','Orders','Cancelled excluded'),(f'₹{p["revenue"]:,.0f}','Revenue','Sale value'),(f'{p["returns"]:,.0f}','Returns','Return units'),(f'{p["return_rate"]:.2f}%','Return Rate','ASIN returns / units')]
-        for x,(v,l,note) in zip(c,vals):
-            with x:k(l,v,note)
-        if p['orders']==0 and p['returns']==0:st.warning('No matching data found for this ASIN.')
-        else:
-            profile={z:p[z] for z in ['sku','product_name','category'] if p.get(z) not in [None,'']}
-            if profile:st.dataframe(pd.DataFrame([profile]),use_container_width=True,hide_index=True)
-            c1,c2=st.columns(2)
-            with c1:
-                st.markdown('### Return Reasons');x=asin_reasons(asin);st.dataframe(x,use_container_width=True,hide_index=True)
-                if PLOTLY and not x.empty:st.plotly_chart(px.pie(x,names='reason',values='returns',hole=.45,title='Why customers return this ASIN'),use_container_width=True)
-            with c2:
-                st.markdown('### Return Locations')
-                loc=PIN or CITY or STATE
-                x=returns_by_location(loc,20) if loc else pd.DataFrame()
-                if not x.empty:st.dataframe(x,use_container_width=True,hide_index=True)
-
-elif page=='📈 Sales Intelligence':
-    st.subheader('📈 Sales Intelligence');a=top_asins(200);r=return_asins(10000)
-    if not a.empty and not r.empty:a=a.merge(r,on='asin',how='left');a['returns']=a.returns.fillna(0);a['return_rate']=(a.returns/a.units.replace(0,pd.NA)*100).fillna(0)
-    st.dataframe(a,use_container_width=True,hide_index=True)
-
-elif page=='↩️ Return Intelligence':
-    st.subheader('↩️ Return Intelligence');c1,c2=st.columns(2)
-    with c1:
-        x=returns_by_reason(30);st.markdown('### Return Reasons');st.dataframe(x,use_container_width=True,hide_index=True)
-        if PLOTLY and not x.empty:st.plotly_chart(px.bar(x.sort_values('returns'),x='returns',y='reason',orientation='h'),use_container_width=True)
-    with c2:
-        st.markdown('### Products with Most Returns');st.dataframe(rd.head(30),use_container_width=True,hide_index=True)
-
-elif page=='📍 Location Intelligence':
-    st.subheader('📍 Location Intelligence');st.caption('Find cities, states and pincodes generating the most returns.')
-    names=[];mapping=[]
-    if PIN:names.append('Pincode');mapping.append(PIN)
-    if CITY:names.append('City');mapping.append(CITY)
-    if STATE:names.append('State');mapping.append(STATE)
-    if not names:st.warning('No ship-postal-code, ship_city or ship_state column found in orders.')
+    if city_col:
+        result = qdf(f"""
+            SELECT
+                COALESCE(NULLIF(TRIM(o.{city_col}),''),'Unknown') AS city,
+                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
+                SUM(r.quantity) AS return_units
+            FROM returns r
+            JOIN orders o ON o.order_id = r.order_id
+            GROUP BY
+                COALESCE(NULLIF(TRIM(o.{city_col}),''),'Unknown'),
+                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+            ORDER BY SUM(r.quantity) DESC
+            LIMIT 30
+        """)
     else:
-        tabs=st.tabs(names)
-        for tab,title,cname in zip(tabs,names,mapping):
-            with tab:
-                x=returns_by_location(cname,50);st.dataframe(x,use_container_width=True,hide_index=True)
-                if PLOTLY and not x.empty:st.plotly_chart(px.bar(x.head(25).sort_values('returns'),x='returns',y='location',orientation='h',title=f'Top return {title.lower()}s'),use_container_width=True)
+        result = qdf(f"""
+            SELECT
+                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
+                SUM(r.quantity) AS return_units
+            FROM returns r
+            JOIN orders o ON o.order_id = r.order_id
+            GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+            ORDER BY SUM(r.quantity) DESC
+            LIMIT 30
+        """)
 
-elif page=='🎯 ASIN Scorecard':
-    st.subheader('🎯 ASIN Scorecard');a=top_asins(300);r=return_asins(10000)
-    if not a.empty:
-        if not r.empty:a=a.merge(r,on='asin',how='left')
-        if 'returns' not in a:a['returns']=0
-        a['returns']=a.returns.fillna(0);a['return_rate']=(a.returns/a.units.replace(0,pd.NA)*100).fillna(0);a['risk']=a.return_rate.apply(lambda x:'HIGH' if x>=15 else ('WATCH' if x>=8 else 'GOOD'))
-        st.dataframe(a.sort_values('return_rate',ascending=False),use_container_width=True,hide_index=True)
+    return result, pc
 
-elif page=='📤 Upload Center':
-    st.subheader('📤 Upload Center');st.info('Keep your existing upload/import workflow here. This dashboard only reads the database.');st.write('Detected tables:',', '.join(TABLES))
+
+def state_returns():
+
+    state_col = find_column(
+        "orders",
+        ["ship_state", "shipping_state", "state"]
+    )
+
+    if not state_col:
+        return pd.DataFrame()
+
+    return qdf(f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(o.{state_col}), ''), 'Unknown') AS state,
+            SUM(r.quantity) AS return_units
+        FROM returns r
+        JOIN orders o ON o.order_id = r.order_id
+        GROUP BY COALESCE(NULLIF(TRIM(o.{state_col}), ''), 'Unknown')
+        ORDER BY SUM(r.quantity) DESC
+    """)
+
+
+def city_returns():
+    city_col = find_column(
+        "orders",
+        ["ship_city", "shipping_city", "city"]
+    )
+
+    if not city_col:
+        return pd.DataFrame()
+
+    return qdf(f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(o.{city_col}), ''), 'Unknown') AS city,
+            SUM(r.quantity) AS return_units
+        FROM returns r
+        JOIN orders o ON o.order_id = r.order_id
+        GROUP BY COALESCE(NULLIF(TRIM(o.{city_col}), ''), 'Unknown')
+        ORDER BY SUM(r.quantity) DESC
+        LIMIT 30
+    """)
+
+
+def scorecard():
+    s = asin_sales()
+    r = return_asin()
+
+    if s.empty:
+        return pd.DataFrame()
+
+    d = s.merge(
+        r,
+        on=["asin", "sku"],
+        how="left"
+    )
+
+    d["return_units"] = pd.to_numeric(
+        d["return_units"],
+        errors="coerce"
+    ).fillna(0)
+
+    d["return_rate"] = (
+        d["return_units"] /
+        d["units"].replace(0, pd.NA) *
+        100
+    ).fillna(0)
+
+    def decision(row):
+        if row["return_rate"] >= 15 and row["return_units"] >= 3:
+            return "🔴 High Return"
+        if row["return_rate"] >= 8 and row["return_units"] >= 2:
+            return "🟡 Watch"
+        return "🟢 Good"
+
+    d["decision"] = d.apply(decision, axis=1)
+
+    return d.sort_values(
+        ["return_rate", "return_units"],
+        ascending=False
+    )
+
+
+def asin_location_data(asin_value):
+    pc = find_column(
+        "orders",
+        [
+            "pincode",
+            "pin_code",
+            "postal_code",
+            "ship_postal_code",
+            "ship_pincode",
+            "ship_pin_code",
+            "zip"
+        ]
+    )
+
+    if not pc:
+        return pd.DataFrame(), None
+
+    df = qdf(f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
+            SUM(r.quantity) AS return_units
+        FROM returns r
+        JOIN orders o ON o.order_id = r.order_id
+        WHERE UPPER(COALESCE(r.asin,'')) = UPPER(?)
+        GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+        ORDER BY SUM(r.quantity) DESC
+        LIMIT 30
+    """, [str(asin_value)])
+
+    return df, pc
+
+
+st.markdown(
+    '<div class="hero">'
+    '<h1>Amazon Ops Analytics Pro</h1>'
+    '<p>Sales intelligence • Return intelligence • ASIN performance • Location analysis</p>'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+with st.sidebar:
+    page = st.radio(
+        "Module",
+        [
+            "Executive Dashboard",
+            "🔎 ASIN Search",
+            "Sales Intelligence",
+            "Return Intelligence",
+            "Location Intelligence",
+            "ASIN Scorecard",
+            "Upload Center",
+            "Data Audit"
+        ]
+    )
+
+revenue, orders, units, returns = summary()
+rate = returns / units * 100 if units else 0
+
+
+if page == "Executive Dashboard":
+
+    st.subheader("Executive Overview")
+
+    for c, (a, b, n) in zip(
+        st.columns(5),
+        [
+            ("Revenue", f"₹{revenue:,.0f}", "Non-cancelled orders"),
+            ("Valid Orders", f"{orders:,}", "Cancelled excluded"),
+            ("Units Sold", f"{units:,}", "Non-cancelled orders"),
+            ("Return Units", f"{returns:,}", "Imported returns"),
+            ("Return Rate", f"{rate:.2f}%", "Returns ÷ sold units")
+        ]
+    ):
+        with c:
+            st.markdown(
+                f'<div class="kpi">'
+                f'<div class="kpi-label">{a}</div>'
+                f'<div class="kpi-value">{b}</div>'
+                f'<div class="kpi-note">{n}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+    d = sales_daily()
+
+    if not d.empty:
+        st.subheader("Sales Trend")
+        d["order_date"] = pd.to_datetime(
+            d["order_date"],
+            errors="coerce"
+        )
+
+        if PLOTLY_OK:
+            st.plotly_chart(
+                px.line(
+                    d,
+                    x="order_date",
+                    y="revenue",
+                    markers=True,
+                    title="Daily Revenue"
+                ),
+                width="stretch"
+            )
+        else:
+            st.line_chart(
+                d.set_index("order_date")["revenue"]
+            )
+
+    a = asin_sales()
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Top ASINs by Revenue")
+        x = a.head(10)
+
+        if PLOTLY_OK and not x.empty:
+            st.plotly_chart(
+                px.bar(
+                    x.sort_values("revenue"),
+                    x="revenue",
+                    y="asin",
+                    orientation="h"
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                x,
+                width="stretch",
+                hide_index=True
+            )
+
+    with c2:
+        st.subheader("Top ASINs by Units")
+        x = a.sort_values(
+            "units",
+            ascending=False
+        ).head(10)
+
+        if PLOTLY_OK and not x.empty:
+            st.plotly_chart(
+                px.bar(
+                    x.sort_values("units"),
+                    x="units",
+                    y="asin",
+                    orientation="h"
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                x,
+                width="stretch",
+                hide_index=True
+            )
+
+
+elif page == "🔎 ASIN Search":
+
+    st.subheader("🔎 ASIN Search & Product Analysis")
+    st.caption(
+        "Search one ASIN and view its complete sales, "
+        "return, reason and location profile."
+    )
+
+    asin_query = st.text_input(
+        "Enter ASIN",
+        placeholder="Example: B0XXXXXXXX",
+        key="asin_search"
+    ).strip()
+
+    if not asin_query:
+        st.info(
+            "Enter an ASIN above to view the complete product analysis."
+        )
+
+    else:
+        sales = asin_sales()
+
+        if sales.empty:
+            st.warning("No sales data is available.")
+
+        else:
+            matches = sales[
+                sales["asin"]
+                .astype(str)
+                .str.upper() == asin_query.upper()
+            ].copy()
+
+            if matches.empty:
+                matches = sales[
+                    sales["asin"]
+                    .astype(str)
+                    .str.contains(
+                        asin_query,
+                        case=False,
+                        na=False
+                    )
+                ].copy()
+
+            if matches.empty:
+                st.error(
+                    f"No sales record found for ASIN: {asin_query}"
+                )
+
+            else:
+                selected = matches.iloc[0]["asin"]
+                product = matches[
+                    matches["asin"].astype(str) == str(selected)
+                ]
+
+                total_units = int(product["units"].sum())
+                total_revenue = float(product["revenue"].sum())
+
+                skus = ", ".join(
+                    product["sku"]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                )
+
+                r = return_asin()
+
+                rr = (
+                    r[r["asin"].astype(str) == str(selected)]
+                    if not r.empty
+                    else pd.DataFrame()
+                )
+
+                return_units = (
+                    int(rr["return_units"].sum())
+                    if not rr.empty and
+                    "return_units" in rr.columns
+                    else 0
+                )
+
+                product_return_rate = (
+                    return_units / total_units * 100
+                    if total_units else 0
+                )
+
+                if (
+                    product_return_rate >= 15
+                    and return_units >= 3
+                ):
+                    status = "🔴 High Return"
+                elif (
+                    product_return_rate >= 8
+                    and return_units >= 2
+                ):
+                    status = "🟡 Watch"
+                else:
+                    status = "🟢 Good"
+
+                st.markdown(
+                    f"### ASIN: `{selected}`"
+                )
+
+                if skus:
+                    st.caption(f"SKU: {skus}")
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+
+                c1.metric(
+                    "Units Sold",
+                    f"{total_units:,}"
+                )
+                c2.metric(
+                    "Sales",
+                    f"₹{total_revenue:,.0f}"
+                )
+                c3.metric(
+                    "Return Units",
+                    f"{return_units:,}"
+                )
+                c4.metric(
+                    "Return Rate",
+                    f"{product_return_rate:.2f}%"
+                )
+                c5.metric(
+                    "Status",
+                    status
+                )
+
+                tab1, tab2, tab3, tab4 = st.tabs(
+                    [
+                        "Sales",
+                        "Returns",
+                        "Reasons",
+                        "Locations"
+                    ]
+                )
+
+                with tab1:
+                    d = qdf(f"""
+                        SELECT
+                            o.order_date,
+                            SUM(oi.quantity) AS units,
+                            SUM(COALESCE(oi.item_price,0)) AS revenue
+                        FROM order_items oi
+                        JOIN orders o
+                            ON o.order_id = oi.order_id
+                        WHERE {ACTIVE}
+                          AND UPPER(COALESCE(oi.asin,'')) = UPPER(?)
+                        GROUP BY o.order_date
+                        ORDER BY o.order_date
+                    """, [str(selected)])
+
+                    if not d.empty:
+                        d["order_date"] = pd.to_datetime(
+                            d["order_date"],
+                            errors="coerce"
+                        )
+
+                        if PLOTLY_OK:
+                            st.plotly_chart(
+                                px.line(
+                                    d,
+                                    x="order_date",
+                                    y="revenue",
+                                    markers=True,
+                                    title="ASIN Sales Trend"
+                                ),
+                                width="stretch"
+                            )
+
+                            st.plotly_chart(
+                                px.bar(
+                                    d,
+                                    x="order_date",
+                                    y="units",
+                                    title="Units Sold by Date"
+                                ),
+                                width="stretch"
+                            )
+
+                        st.dataframe(
+                            d,
+                            width="stretch",
+                            hide_index=True
+                        )
+
+                    else:
+                        st.info(
+                            "No sales trend data found."
+                        )
+
+                with tab2:
+                    # Build the return-detail query only from columns that exist.
+                    return_cols = cols("returns")
+                    lower_returns = {c.lower(): c for c in return_cols}
+
+                    def rc(*names):
+                        for name in names:
+                            if name.lower() in lower_returns:
+                                return lower_returns[name.lower()]
+                        return None
+
+                    date_col = rc(
+                        "return_date", "return_request_date",
+                        "return_creation_date", "return_creation_timestamp",
+                        "return_date_time", "date", "authorization_date"
+                    )
+                    order_col = rc("order_id")
+                    sku_col = rc("sku", "merchant_sku")
+                    qty_col = rc("quantity", "return_quantity")
+                    reason_col = rc("reason", "return_reason")
+                    comment_col = rc("customer_comment", "customer_comments", "comment")
+                    disposition_col = rc("disposition", "resolution")
+
+                    select_parts = []
+                    for col, alias, fallback in [
+                        (date_col, "return_date", "NULL"),
+                        (order_col, "order_id", "NULL"),
+                        (sku_col, "sku", "NULL"),
+                        (qty_col, "quantity", "0"),
+                        (reason_col, "reason", "NULL"),
+                        (comment_col, "customer_comment", "NULL"),
+                        (disposition_col, "disposition", "NULL"),
+                    ]:
+                        select_parts.append(
+                            f'"{col}" AS {alias}' if col else f'{fallback} AS {alias}'
+                        )
+
+                    order_sql = f' ORDER BY "{date_col}" DESC' if date_col else ''
+                    rd = qdf(
+                        "SELECT " + ", ".join(select_parts) +
+                        " FROM returns WHERE UPPER(COALESCE(asin,'')) = UPPER(?)" +
+                        order_sql,
+                        [str(selected)]
+                    )
+
+                    if rd.empty:
+                        st.success(
+                            "No returns found for this ASIN."
+                        )
+                    else:
+                        st.dataframe(
+                            rd,
+                            width="stretch",
+                            hide_index=True
+                        )
+
+                        st.download_button(
+                            "Download ASIN Returns CSV",
+                            rd.to_csv(index=False).encode("utf-8"),
+                            f"{selected}_returns.csv",
+                            "text/csv"
+                        )
+
+                with tab3:
+                    reasons = qdf("""
+                        SELECT
+                            COALESCE(
+                                NULLIF(TRIM(reason),''),
+                                'Unknown'
+                            ) AS reason,
+                            SUM(quantity) AS return_units
+                        FROM returns
+                        WHERE UPPER(COALESCE(asin,'')) = UPPER(?)
+                        GROUP BY
+                            COALESCE(
+                                NULLIF(TRIM(reason),''),
+                                'Unknown'
+                            )
+                        ORDER BY SUM(quantity) DESC
+                    """, [str(selected)])
+
+                    if reasons.empty:
+                        st.info(
+                            "No return reasons found."
+                        )
+                    else:
+                        c1, c2 = st.columns(
+                            [1.2, 1]
+                        )
+
+                        with c1:
+                            if PLOTLY_OK:
+                                st.plotly_chart(
+                                    px.bar(
+                                        reasons,
+                                        x="return_units",
+                                        y="reason",
+                                        orientation="h",
+                                        title="Return Reasons"
+                                    ),
+                                    width="stretch"
+                                )
+
+                        with c2:
+                            st.dataframe(
+                                reasons,
+                                width="stretch",
+                                hide_index=True
+                            )
+
+                with tab4:
+                    loc, pc = asin_location_data(
+                        selected
+                    )
+
+                    if pc:
+                        if not loc.empty:
+                            st.dataframe(
+                                loc,
+                                width="stretch",
+                                hide_index=True
+                            )
+
+                            if PLOTLY_OK:
+                                st.plotly_chart(
+                                    px.bar(
+                                        loc.head(15)
+                                        .sort_values(
+                                            "return_units"
+                                        ),
+                                        x="return_units",
+                                        y="pincode",
+                                        orientation="h",
+                                        title="Top Return Pincodes"
+                                    ),
+                                    width="stretch"
+                                )
+                        else:
+                            st.info(
+                                "No pincode return data found "
+                                "for this ASIN."
+                            )
+                    else:
+                        st.warning(
+                            "Pincode is not stored in the current "
+                            "orders table. Once pincode is added to "
+                            "the database/import, this section will "
+                            "show return hotspots."
+                        )
+
+
+elif page == "Sales Intelligence":
+
+    st.subheader("Sales Intelligence")
+    st.caption("Sale Price = Amazon item-price only. item-tax is stored separately and is NOT added to Sale Price.")
+
+    d = asin_sales()
+
+    search = st.text_input(
+        "Search ASIN / SKU"
+    )
+
+    if search:
+        d = d[
+            d.astype(str)
+            .apply(
+                lambda x: x.str.contains(
+                    search,
+                    case=False,
+                    na=False
+                )
+            )
+            .any(axis=1)
+        ]
+
+    st.dataframe(
+        d,
+        width="stretch",
+        hide_index=True
+    )
+
+    st.download_button(
+        "Download Sales CSV",
+        d.to_csv(index=False).encode(),
+        "sales_analysis.csv",
+        "text/csv"
+    )
+
+
+elif page == "Return Intelligence":
+
+    st.subheader("Return Intelligence")
+
+    r = return_reasons()
+    a = return_asin()
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("### Return Reasons")
+
+        if not r.empty and PLOTLY_OK:
+            st.plotly_chart(
+                px.pie(
+                    r.head(12),
+                    names="reason",
+                    values="return_units",
+                    hole=.45
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                r,
+                width="stretch",
+                hide_index=True
+            )
+
+    with c2:
+        st.markdown("### Top Return ASINs")
+
+        if not a.empty and PLOTLY_OK:
+            st.plotly_chart(
+                px.bar(
+                    a.head(12).sort_values(
+                        "return_units"
+                    ),
+                    x="return_units",
+                    y="asin",
+                    orientation="h"
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                a,
+                width="stretch",
+                hide_index=True
+            )
+
+    s = scorecard()
+
+    st.markdown("### Return Rate by ASIN")
+
+    st.dataframe(
+        s,
+        width="stretch",
+        hide_index=True
+    )
+
+
+elif page == "Location Intelligence":
+
+    st.subheader("Location Intelligence")
+
+    p, pc = locations()
+
+    if pc:
+        st.caption(
+            f"Return hotspots based on shipping pincode: orders.{pc}. Shipping city is shown when available."
+        )
+    else:
+        st.caption(
+            "Pincode is shown when it exists in the orders database."
+        )
+
+    c1, c2 = st.columns(2)
+
+    sr = state_returns()
+    cr = city_returns()
+
+    with c1:
+        st.markdown("### Returns by State")
+
+        if not sr.empty and PLOTLY_OK:
+            st.plotly_chart(
+                px.bar(
+                    sr.head(15).sort_values(
+                        "return_units"
+                    ),
+                    x="return_units",
+                    y="state",
+                    orientation="h"
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                sr,
+                width="stretch",
+                hide_index=True
+            )
+
+    with c2:
+        st.markdown("### Returns by City")
+
+        if not cr.empty and PLOTLY_OK:
+            st.plotly_chart(
+                px.bar(
+                    cr.head(15).sort_values(
+                        "return_units"
+                    ),
+                    x="return_units",
+                    y="city",
+                    orientation="h"
+                ),
+                width="stretch"
+            )
+        else:
+            st.dataframe(
+                cr,
+                width="stretch",
+                hide_index=True
+            )
+
+    st.markdown("### Top Return Pincodes / Cities")
+
+    if p.empty:
+        st.warning(
+            "Pincode is not stored in the orders table yet."
+        )
+    else:
+        st.dataframe(
+            p,
+            width="stretch",
+            hide_index=True
+        )
+
+
+elif page == "ASIN Scorecard":
+
+    st.subheader(
+        "ASIN Product Decision Scorecard"
+    )
+
+    s = scorecard()
+
+    if s.empty:
+        st.info(
+            "No sales/return data available."
+        )
+    else:
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "High Return ASINs",
+            int(
+                (s["decision"] == "🔴 High Return").sum()
+            )
+        )
+
+        c2.metric(
+            "Watch ASINs",
+            int(
+                (s["decision"] == "🟡 Watch").sum()
+            )
+        )
+
+        c3.metric(
+            "Good ASINs",
+            int(
+                (s["decision"] == "🟢 Good").sum()
+            )
+        )
+
+        st.dataframe(
+            s,
+            width="stretch",
+            hide_index=True
+        )
+
+
+elif page == "Upload Center":
+
+    st.subheader(
+        "Amazon Report Upload Center"
+    )
+
+    typ = st.selectbox(
+        "Report Type",
+        ["Orders", "Returns"]
+    )
+
+    f = st.file_uploader(
+        "Upload Amazon report",
+        type=["txt", "tsv", "csv", "xlsx", "xls"]
+    )
+
+    if f and st.button(
+        "Import Report",
+        type="primary"
+    ):
+        try:
+            result = ingest_report(
+                f,
+                typ
+            )
+
+            st.success(
+                result["message"]
+            )
+
+            st.json(result)
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(
+                f"Import failed: {e}"
+            )
+
 
 else:
-    st.subheader('🛠️ Data Audit');rows=[]
-    for label,value in [('Orders table',OT),('Returns table',RT),('ASIN',A),('SKU',S),('Order ID',OID),('Order date',OD),('Quantity',Q),('Item price / sale price',PRICE),('Item tax',TAX),('Ship city',CITY),('Ship state',STATE),('Ship postal code',PIN),('Order status',STATUS),('Return ASIN',RA),('Return date',RDATE),('Return quantity',RQ),('Return reason',RR)]:rows.append({'Field':label,'Detected column':value or 'NOT FOUND'})
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-    for t in TABLES:
-        with st.expander(t):st.code(', '.join(cols(t)))
 
-st.divider();st.caption('Amazon Ops Analytics Pro • Cancelled orders are excluded from sales KPIs and sales analysis.')
+    st.subheader("Data Audit")
+
+    st.dataframe(
+        pd.DataFrame(
+            [{
+                "All Orders": scalar(
+                    "SELECT COUNT(*) FROM orders"
+                ),
+                "Active Orders": scalar(
+                    f"SELECT COUNT(*) FROM orders o WHERE {ACTIVE}"
+                ),
+                "Cancelled Orders": scalar(
+                    """
+                    SELECT COUNT(*)
+                    FROM orders o
+                    WHERE COALESCE(
+                        LOWER(TRIM(o.order_status)),
+                        ''
+                    ) LIKE '%cancel%'
+                    """
+                ),
+                "Order Items": scalar(
+                    "SELECT COUNT(*) FROM order_items"
+                ),
+                "Returns": scalar(
+                    "SELECT COUNT(*) FROM returns"
+                )
+            }]
+        ),
+        width="stretch",
+        hide_index=True
+    )
+
+    st.info(
+        "Cancelled orders remain available for audit "
+        "but are excluded from sales analytics."
+    )
