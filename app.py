@@ -13,31 +13,48 @@ from ingest import ingest_report
 
 try:
     import plotly.express as px
+    import plotly.graph_objects as go
     PLOTLY_OK = True
 except Exception:
     PLOTLY_OK = False
 
-st.set_page_config(
-    page_title="Amazon Ops Analytics Pro",
-    page_icon="📊",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Amazon Ops Analytics Pro", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
 init_db()
 
-st.markdown("""
+# -----------------------------
+# Professional UI
+# -----------------------------
+st.markdown(r"""
 <style>
-.block-container{padding-top:1.2rem}
-.hero{padding:22px 26px;border-radius:16px;background:linear-gradient(135deg,#111827,#26354d);color:white;margin-bottom:20px}
-.hero h1{margin:0;font-size:34px}.hero p{margin:6px 0 0;opacity:.82}
-.kpi{border:1px solid #e5e7eb;border-radius:14px;padding:16px;background:white;min-height:105px}
-.kpi-label{font-size:13px;color:#6b7280}.kpi-value{font-size:27px;font-weight:700;margin-top:5px}.kpi-note{font-size:12px;color:#6b7280}
+:root{--navy:#102746;--blue:#1476e8;--muted:#718096;--border:#e5eaf1;--bg:#f6f8fb}
+.stApp{background:#f7f9fc;color:#152238}
+.block-container{padding:0 1.4rem 2rem;max-width:100%}
+section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0e2340 0%,#142f50 100%);border-right:0}
+section[data-testid="stSidebar"] *{color:#e9f1fb!important}
+section[data-testid="stSidebar"] .stRadio label{padding:8px 10px;border-radius:9px;margin:2px 0}
+section[data-testid="stSidebar"] .stRadio label:hover{background:rgba(255,255,255,.08)}
+.brand{padding:16px 8px 18px;border-bottom:1px solid rgba(255,255,255,.12);margin-bottom:14px}
+.brand-row{display:flex;align-items:center;gap:10px}.brand-logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#1685ef,#62b2ff);display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 20px rgba(0,0,0,.18)}
+.brand-title{font-size:18px;font-weight:800;line-height:1.05}.brand-sub{font-size:11px;opacity:.75;margin-top:3px}
+.topbar{height:66px;background:white;border:1px solid var(--border);border-radius:0 0 14px 14px;padding:10px 16px;margin:0 -1.4rem 18px;box-shadow:0 3px 16px rgba(30,55,90,.06)}
+.hero{background:linear-gradient(105deg,#eef7ff 0%,#ffffff 62%,#d9edff 100%);border:1px solid #d9e8f7;border-radius:16px;padding:22px 28px;margin-bottom:16px;overflow:hidden}
+.hero h1{font-size:30px;margin:0;color:#122744;font-weight:800}.hero p{margin:5px 0 0;color:#60738d;font-size:14px}
+.section-title{font-size:19px;font-weight:800;color:#18283f;margin:18px 0 10px}
+.kpi{background:#fff;border:1px solid var(--border);border-radius:14px;padding:16px 17px;min-height:122px;box-shadow:0 3px 12px rgba(35,57,85,.045)}
+.kpi-top{display:flex;align-items:center;gap:10px}.kpi-icon{width:40px;height:40px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:20px}.kpi-label{font-size:12px;color:#64748b}.kpi-value{font-size:25px;font-weight:800;color:#13253e;margin-top:7px}.kpi-note{font-size:11px;color:#8a98aa;margin-top:4px}.good{color:#0ca678!important}.bad{color:#ef4444!important}
+.card{background:#fff;border:1px solid var(--border);border-radius:14px;padding:15px 16px;box-shadow:0 3px 12px rgba(35,57,85,.045)}
+.small-title{font-size:15px;font-weight:800;color:#17263d;margin-bottom:8px}
+div[data-testid="stMetric"]{background:#fff;border:1px solid var(--border);border-radius:12px;padding:10px}
+button[data-baseweb="tab"]{font-weight:600}
+[data-testid="stDataFrame"]{border-radius:10px}
+.stButton>button{border-radius:9px;font-weight:700}
+hr{border-color:#e8edf3}
 </style>
 """, unsafe_allow_html=True)
 
 
 def qdf(sql, params=None):
-    con = connect()
+    con=connect()
     try:
         return pd.read_sql_query(sql, con, params=params or [])
     finally:
@@ -45,1061 +62,269 @@ def qdf(sql, params=None):
 
 
 def scalar(sql, params=None):
-    con = connect()
+    con=connect()
     try:
-        row = con.execute(sql, params or []).fetchone()
+        row=con.execute(sql, params or []).fetchone()
         return row[0] if row and row[0] is not None else 0
     finally:
         con.close()
 
 
 def cols(table):
-    con = connect()
+    con=connect()
     try:
         return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
     finally:
         con.close()
 
 
-# Cancelled orders are retained in the database for audit,
-# but excluded from sales analytics.
-ACTIVE = """
-COALESCE(LOWER(TRIM(o.order_status)), '') NOT LIKE '%cancel%'
-"""
-
-
 def find_column(table, candidates):
-    available = cols(table)
-    lower_map = {c.lower(): c for c in available}
-
-    for candidate in candidates:
-        if candidate.lower() in lower_map:
-            return lower_map[candidate.lower()]
-
+    available=cols(table); low={c.lower():c for c in available}
+    for c in candidates:
+        if c.lower() in low: return low[c.lower()]
     return None
+
+ORDERS_COLS=cols("orders")
+ITEM_COLS=cols("order_items")
+RET_COLS=cols("returns")
+STATUS_COL=find_column("orders",["order_status","status","order_state"])
+ORDER_DATE_COL=find_column("orders",["order_date","purchase_date","order_created_date"])
+ACTIVE=f"COALESCE(LOWER(TRIM(o.{STATUS_COL})), '') NOT LIKE '%cancel%'" if STATUS_COL else "1=1"
 
 
 def summary():
-    rev = scalar(f"""
-        SELECT COALESCE(
-            SUM(COALESCE(oi.item_price,0)), 0
-        )
-        FROM order_items oi
-        JOIN orders o ON o.order_id = oi.order_id
-        WHERE {ACTIVE}
-    """)
-
-    orders = scalar(f"""
-        SELECT COUNT(DISTINCT o.order_id)
-        FROM orders o
-        WHERE {ACTIVE}
-    """)
-
-    units = scalar(f"""
-        SELECT COALESCE(SUM(oi.quantity),0)
-        FROM order_items oi
-        JOIN orders o ON o.order_id = oi.order_id
-        WHERE {ACTIVE}
-    """)
-
-    returns = scalar("""
-        SELECT COALESCE(SUM(quantity),0)
-        FROM returns
-    """)
-
-    return float(rev), int(orders), int(units), int(returns)
+    rev=scalar(f"SELECT COALESCE(SUM(COALESCE(oi.item_price,0)),0) FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE}")
+    orders=scalar(f"SELECT COUNT(DISTINCT o.order_id) FROM orders o WHERE {ACTIVE}")
+    units=scalar(f"SELECT COALESCE(SUM(oi.quantity),0) FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE}")
+    returns=scalar("SELECT COALESCE(SUM(quantity),0) FROM returns")
+    cancelled=scalar(f"SELECT COUNT(*) FROM orders o WHERE COALESCE(LOWER(TRIM(o.{STATUS_COL or 'order_status'})),'') LIKE '%cancel%'") if STATUS_COL or 'order_status' in ORDERS_COLS else 0
+    return float(rev),int(orders),int(units),int(returns),int(cancelled)
 
 
 def sales_daily():
-    return qdf(f"""
-        SELECT
-            o.order_date,
-            COUNT(DISTINCT o.order_id) AS orders,
-            SUM(oi.quantity) AS units,
-            SUM(COALESCE(oi.item_price,0)) AS revenue
-        FROM orders o
-        JOIN order_items oi ON o.order_id = oi.order_id
-        WHERE {ACTIVE}
-        GROUP BY o.order_date
-        ORDER BY o.order_date
-    """)
+    if not ORDER_DATE_COL: return pd.DataFrame()
+    return qdf(f"""SELECT o.{ORDER_DATE_COL} order_date, COUNT(DISTINCT o.order_id) orders, COALESCE(SUM(oi.quantity),0) units, COALESCE(SUM(oi.item_price),0) revenue FROM orders o JOIN order_items oi ON o.order_id=oi.order_id WHERE {ACTIVE} GROUP BY o.{ORDER_DATE_COL} ORDER BY o.{ORDER_DATE_COL}""")
 
 
 def asin_sales():
-    return qdf(f"""
-        SELECT
-            oi.asin,
-            oi.sku,
-            SUM(oi.quantity) AS units,
-            SUM(COALESCE(oi.item_price,0)) AS revenue
-        FROM order_items oi
-        JOIN orders o ON o.order_id = oi.order_id
-        WHERE {ACTIVE}
-        GROUP BY oi.asin, oi.sku
-        ORDER BY revenue DESC
-    """)
+    return qdf(f"""SELECT oi.asin, oi.sku, COALESCE(SUM(oi.quantity),0) units, COALESCE(SUM(oi.item_price),0) revenue FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE} GROUP BY oi.asin,oi.sku ORDER BY revenue DESC""")
 
 
 def return_asin():
-    return qdf("""
-        SELECT
-            asin,
-            sku,
-            SUM(quantity) AS return_units
-        FROM returns
-        GROUP BY asin, sku
-        ORDER BY SUM(quantity) DESC
-    """)
+    return qdf("SELECT asin,sku,COALESCE(SUM(quantity),0) return_units FROM returns GROUP BY asin,sku ORDER BY SUM(quantity) DESC")
 
 
-def return_reasons():
-    if "reason" not in cols("returns"):
-        return pd.DataFrame()
-
-    return qdf("""
-        SELECT
-            COALESCE(NULLIF(TRIM(reason),''),'Unknown') AS reason,
-            SUM(quantity) AS return_units
-        FROM returns
-        GROUP BY COALESCE(NULLIF(TRIM(reason),''),'Unknown')
-        ORDER BY SUM(quantity) DESC
-    """)
+def return_reasons(asin=None):
+    reason_col=find_column("returns",["reason","return_reason"])
+    if not reason_col: return pd.DataFrame()
+    sql=f"SELECT COALESCE(NULLIF(TRIM({reason_col}),''),'Unknown') reason, COALESCE(SUM(quantity),0) return_units FROM returns"
+    params=[]
+    if asin:
+        sql+=" WHERE UPPER(COALESCE(asin,''))=UPPER(?)"; params=[str(asin)]
+    sql+=" GROUP BY COALESCE(NULLIF(TRIM("+reason_col+"),''),'Unknown') ORDER BY SUM(quantity) DESC"
+    return qdf(sql,params)
 
 
 def locations():
-    """
-    Return hotspots using the shipping fields imported from the Amazon
-    order report: ship-city and ship-postal-code.
-    """
-    oc = cols("orders")
-
-    pc = find_column(
-        "orders",
-        [
-            "ship_postal_code",
-            "ship_pincode",
-            "ship_pin_code",
-            "postal_code",
-            "pincode",
-            "pin_code",
-            "zip"
-        ]
-    )
-
-    city_col = find_column(
-        "orders",
-        ["ship_city", "shipping_city", "city"]
-    )
-
-    if not pc:
-        return pd.DataFrame(), None
-
-    if city_col:
-        result = qdf(f"""
-            SELECT
-                COALESCE(NULLIF(TRIM(o.{city_col}),''),'Unknown') AS city,
-                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
-                SUM(r.quantity) AS return_units
-            FROM returns r
-            JOIN orders o ON o.order_id = r.order_id
-            GROUP BY
-                COALESCE(NULLIF(TRIM(o.{city_col}),''),'Unknown'),
-                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
-            ORDER BY SUM(r.quantity) DESC
-            LIMIT 30
-        """)
-    else:
-        result = qdf(f"""
-            SELECT
-                COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
-                SUM(r.quantity) AS return_units
-            FROM returns r
-            JOIN orders o ON o.order_id = r.order_id
-            GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
-            ORDER BY SUM(r.quantity) DESC
-            LIMIT 30
-        """)
-
-    return result, pc
+    pc=find_column("orders",["ship_postal_code","ship_pincode","ship_pin_code","postal_code","pincode","pin_code","zip"])
+    city=find_column("orders",["ship_city","shipping_city","city"])
+    if not pc:return pd.DataFrame(),None
+    if city:
+        return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown') city, COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode, SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown'),COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30"""),pc
+    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30"""),pc
 
 
 def state_returns():
-
-    state_col = find_column(
-        "orders",
-        ["ship_state", "shipping_state", "state"]
-    )
-
-    if not state_col:
-        return pd.DataFrame()
-
-    return qdf(f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(o.{state_col}), ''), 'Unknown') AS state,
-            SUM(r.quantity) AS return_units
-        FROM returns r
-        JOIN orders o ON o.order_id = r.order_id
-        GROUP BY COALESCE(NULLIF(TRIM(o.{state_col}), ''), 'Unknown')
-        ORDER BY SUM(r.quantity) DESC
-    """)
+    c=find_column("orders",["ship_state","shipping_state","state"])
+    if not c:return pd.DataFrame()
+    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') state,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') ORDER BY SUM(r.quantity) DESC""")
 
 
 def city_returns():
-    city_col = find_column(
-        "orders",
-        ["ship_city", "shipping_city", "city"]
-    )
-
-    if not city_col:
-        return pd.DataFrame()
-
-    return qdf(f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(o.{city_col}), ''), 'Unknown') AS city,
-            SUM(r.quantity) AS return_units
-        FROM returns r
-        JOIN orders o ON o.order_id = r.order_id
-        GROUP BY COALESCE(NULLIF(TRIM(o.{city_col}), ''), 'Unknown')
-        ORDER BY SUM(r.quantity) DESC
-        LIMIT 30
-    """)
+    c=find_column("orders",["ship_city","shipping_city","city"])
+    if not c:return pd.DataFrame()
+    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') city,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30""")
 
 
 def scorecard():
-    s = asin_sales()
-    r = return_asin()
-
-    if s.empty:
-        return pd.DataFrame()
-
-    d = s.merge(
-        r,
-        on=["asin", "sku"],
-        how="left"
-    )
-
-    d["return_units"] = pd.to_numeric(
-        d["return_units"],
-        errors="coerce"
-    ).fillna(0)
-
-    d["return_rate"] = (
-        d["return_units"] /
-        d["units"].replace(0, pd.NA) *
-        100
-    ).fillna(0)
-
-    def decision(row):
-        if row["return_rate"] >= 15 and row["return_units"] >= 3:
-            return "🔴 High Return"
-        if row["return_rate"] >= 8 and row["return_units"] >= 2:
-            return "🟡 Watch"
-        return "🟢 Good"
-
-    d["decision"] = d.apply(decision, axis=1)
-
-    return d.sort_values(
-        ["return_rate", "return_units"],
-        ascending=False
-    )
+    s=asin_sales(); r=return_asin()
+    if s.empty:return pd.DataFrame()
+    d=s.merge(r,on=["asin","sku"],how="left"); d["return_units"]=pd.to_numeric(d["return_units"],errors="coerce").fillna(0)
+    d["return_rate"]=(d.return_units/d.units.replace(0,pd.NA)*100).fillna(0)
+    d["decision"]=d.apply(lambda x:"🔴 High Return" if x.return_rate>=15 and x.return_units>=3 else ("🟡 Watch" if x.return_rate>=8 and x.return_units>=2 else "🟢 Good"),axis=1)
+    return d.sort_values(["return_rate","return_units"],ascending=False)
 
 
-def asin_location_data(asin_value):
-    pc = find_column(
-        "orders",
-        [
-            "pincode",
-            "pin_code",
-            "postal_code",
-            "ship_postal_code",
-            "ship_pincode",
-            "ship_pin_code",
-            "zip"
-        ]
-    )
-
-    if not pc:
-        return pd.DataFrame(), None
-
-    df = qdf(f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') AS pincode,
-            SUM(r.quantity) AS return_units
-        FROM returns r
-        JOIN orders o ON o.order_id = r.order_id
-        WHERE UPPER(COALESCE(r.asin,'')) = UPPER(?)
-        GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
-        ORDER BY SUM(r.quantity) DESC
-        LIMIT 30
-    """, [str(asin_value)])
-
-    return df, pc
+def asin_location_data(asin):
+    pc=find_column("orders",["ship_postal_code","ship_pincode","ship_pin_code","postal_code","pincode","pin_code","zip"])
+    if not pc:return pd.DataFrame(),None
+    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id WHERE UPPER(COALESCE(r.asin,''))=UPPER(?) GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30""",[str(asin)]),pc
 
 
-st.markdown(
-    '<div class="hero">'
-    '<h1>Amazon Ops Analytics Pro</h1>'
-    '<p>Sales intelligence • Return intelligence • ASIN performance • Location analysis</p>'
-    '</div>',
-    unsafe_allow_html=True
-)
+def money(v): return f"₹{v:,.0f}"
 
+def chart(fig):
+    if PLOTLY_OK: st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False})
+
+# Sidebar
 with st.sidebar:
-    page = st.radio(
-        "Module",
-        [
-            "Executive Dashboard",
-            "🔎 ASIN Search",
-            "Sales Intelligence",
-            "Return Intelligence",
-            "Location Intelligence",
-            "ASIN Scorecard",
-            "Upload Center",
-            "Data Audit"
-        ]
-    )
+    st.markdown('<div class="brand"><div class="brand-row"><div class="brand-logo">📦</div><div><div class="brand-title">Amazon Ops</div><div class="brand-sub">Analytics Pro</div></div></div></div>',unsafe_allow_html=True)
+    page=st.radio("Module",["Dashboard","Orders","Returns","ASIN Search","Sales Intelligence","Return Intelligence","Location Analysis","ASIN Scorecard","Upload Center","Data Audit","Reports"],label_visibility="collapsed")
+    st.markdown('<div style="margin-top:30px;padding:15px;border-radius:13px;background:rgba(255,255,255,.08)"><b>Keep Growing</b><br><span style="font-size:12px;opacity:.75">Data Driven<br>Better Decisions</span></div>',unsafe_allow_html=True)
 
-revenue, orders, units, returns = summary()
-rate = returns / units * 100 if units else 0
+# top bar
+rev,orders,units,returns,cancelled=summary(); rate=returns/units*100 if units else 0
+st.markdown('<div class="topbar">',unsafe_allow_html=True)
+t1,t2,t3=st.columns([3.5,1.5,1])
+with t1:
+    global_search=st.text_input("Global search",placeholder="Search by ASIN, SKU, Order ID, Product name...",label_visibility="collapsed")
+with t2:
+    st.date_input("Date range",value=(pd.Timestamp("2026-08-01").date(),pd.Timestamp("2026-08-31").date()),label_visibility="collapsed")
+with t3:
+    st.markdown('<div style="text-align:right;padding-top:7px;font-weight:700;color:#24364f">YK &nbsp; Yogesh Kumar<br><span style="font-size:11px;color:#8492a6;font-weight:400">Admin</span></div>',unsafe_allow_html=True)
+st.markdown('</div>',unsafe_allow_html=True)
 
-
-if page == "Executive Dashboard":
-
-    st.subheader("Executive Overview")
-
-    for c, (a, b, n) in zip(
-        st.columns(5),
-        [
-            ("Revenue", f"₹{revenue:,.0f}", "Non-cancelled orders"),
-            ("Valid Orders", f"{orders:,}", "Cancelled excluded"),
-            ("Units Sold", f"{units:,}", "Non-cancelled orders"),
-            ("Return Units", f"{returns:,}", "Imported returns"),
-            ("Return Rate", f"{rate:.2f}%", "Returns ÷ sold units")
-        ]
-    ):
-        with c:
-            st.markdown(
-                f'<div class="kpi">'
-                f'<div class="kpi-label">{a}</div>'
-                f'<div class="kpi-value">{b}</div>'
-                f'<div class="kpi-note">{n}</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-    d = sales_daily()
-
-    if not d.empty:
-        st.subheader("Sales Trend")
-        d["order_date"] = pd.to_datetime(
-            d["order_date"],
-            errors="coerce"
-        )
-
-        if PLOTLY_OK:
-            st.plotly_chart(
-                px.line(
-                    d,
-                    x="order_date",
-                    y="revenue",
-                    markers=True,
-                    title="Daily Revenue"
-                ),
-                width="stretch"
-            )
-        else:
-            st.line_chart(
-                d.set_index("order_date")["revenue"]
-            )
-
-    a = asin_sales()
-
-    c1, c2 = st.columns(2)
-
+if page=="Dashboard":
+    st.markdown('<div class="hero"><h1>Welcome Back,</h1><h1>Amazon Ops Analytics Pro</h1><p>Sales intelligence • Return intelligence • ASIN performance • Location analysis</p></div>',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Executive Overview</div>',unsafe_allow_html=True)
+    vals=[("🛒","Total Revenue",money(rev),"Non-cancelled orders","blue"),("📦","Valid Orders",f"{orders:,}","Cancelled excluded","green"),("🛍️","Units Sold",f"{units:,}","Non-cancelled orders","purple"),("↩️","Return Units",f"{returns:,}","Imported returns","orange"),("%","Return Rate",f"{rate:.2f}%","Returns ÷ sold units","pink")]
+    for c,(ic,l,v,n,col) in zip(st.columns(5),vals):
+        with c: st.markdown(f'<div class="kpi"><div class="kpi-top"><div class="kpi-icon" style="background:#edf5ff">{ic}</div><div class="kpi-label">{l}</div></div><div class="kpi-value">{v}</div><div class="kpi-note">{n}</div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Sales & Order Performance</div>',unsafe_allow_html=True)
+    c1,c2=st.columns([1.65,1])
+    d=sales_daily()
     with c1:
-        st.subheader("Top ASINs by Revenue")
-        x = a.head(10)
-
-        if PLOTLY_OK and not x.empty:
-            st.plotly_chart(
-                px.bar(
-                    x.sort_values("revenue"),
-                    x="revenue",
-                    y="asin",
-                    orientation="h"
-                ),
-                width="stretch"
-            )
-        else:
-            st.dataframe(
-                x,
-                width="stretch",
-                hide_index=True
-            )
-
+        st.markdown('<div class="card"><div class="small-title">📊 Sales Trend</div>',unsafe_allow_html=True)
+        if not d.empty:
+            d["order_date"]=pd.to_datetime(d.order_date,errors="coerce"); d=d.dropna(subset=["order_date"])
+            if PLOTLY_OK:
+                fig=px.area(d,x="order_date",y="revenue",markers=True); fig.update_traces(line_color="#1677e8",fillcolor="rgba(22,119,232,.12)"); fig.update_layout(height=320,margin=dict(l=10,r=10,t=10,b=10),paper_bgcolor="white",plot_bgcolor="white",xaxis_title=None,yaxis_title=None)
+                chart(fig)
+            else: st.line_chart(d.set_index("order_date").revenue)
+        else: st.info("No sales trend data available.")
+        st.markdown('</div>',unsafe_allow_html=True)
     with c2:
-        st.subheader("Top ASINs by Units")
-        x = a.sort_values(
-            "units",
-            ascending=False
-        ).head(10)
-
-        if PLOTLY_OK and not x.empty:
-            st.plotly_chart(
-                px.bar(
-                    x.sort_values("units"),
-                    x="units",
-                    y="asin",
-                    orientation="h"
-                ),
-                width="stretch"
-            )
-        else:
-            st.dataframe(
-                x,
-                width="stretch",
-                hide_index=True
-            )
-
-
-elif page == "🔎 ASIN Search":
-
-    st.subheader("🔎 ASIN Search & Product Analysis")
-    st.caption(
-        "Search one ASIN and view its complete sales, "
-        "return, reason and location profile."
-    )
-
-    asin_query = st.text_input(
-        "Enter ASIN",
-        placeholder="Example: B0XXXXXXXX",
-        key="asin_search"
-    ).strip()
-
-    if not asin_query:
-        st.info(
-            "Enter an ASIN above to view the complete product analysis."
-        )
-
-    else:
-        sales = asin_sales()
-
-        if sales.empty:
-            st.warning("No sales data is available.")
-
-        else:
-            matches = sales[
-                sales["asin"]
-                .astype(str)
-                .str.upper() == asin_query.upper()
-            ].copy()
-
-            if matches.empty:
-                matches = sales[
-                    sales["asin"]
-                    .astype(str)
-                    .str.contains(
-                        asin_query,
-                        case=False,
-                        na=False
-                    )
-                ].copy()
-
-            if matches.empty:
-                st.error(
-                    f"No sales record found for ASIN: {asin_query}"
-                )
-
-            else:
-                selected = matches.iloc[0]["asin"]
-                product = matches[
-                    matches["asin"].astype(str) == str(selected)
-                ]
-
-                total_units = int(product["units"].sum())
-                total_revenue = float(product["revenue"].sum())
-
-                skus = ", ".join(
-                    product["sku"]
-                    .dropna()
-                    .astype(str)
-                    .unique()
-                )
-
-                r = return_asin()
-
-                rr = (
-                    r[r["asin"].astype(str) == str(selected)]
-                    if not r.empty
-                    else pd.DataFrame()
-                )
-
-                return_units = (
-                    int(rr["return_units"].sum())
-                    if not rr.empty and
-                    "return_units" in rr.columns
-                    else 0
-                )
-
-                product_return_rate = (
-                    return_units / total_units * 100
-                    if total_units else 0
-                )
-
-                if (
-                    product_return_rate >= 15
-                    and return_units >= 3
-                ):
-                    status = "🔴 High Return"
-                elif (
-                    product_return_rate >= 8
-                    and return_units >= 2
-                ):
-                    status = "🟡 Watch"
-                else:
-                    status = "🟢 Good"
-
-                st.markdown(
-                    f"### ASIN: `{selected}`"
-                )
-
-                if skus:
-                    st.caption(f"SKU: {skus}")
-
-                c1, c2, c3, c4, c5 = st.columns(5)
-
-                c1.metric(
-                    "Units Sold",
-                    f"{total_units:,}"
-                )
-                c2.metric(
-                    "Sales",
-                    f"₹{total_revenue:,.0f}"
-                )
-                c3.metric(
-                    "Return Units",
-                    f"{return_units:,}"
-                )
-                c4.metric(
-                    "Return Rate",
-                    f"{product_return_rate:.2f}%"
-                )
-                c5.metric(
-                    "Status",
-                    status
-                )
-
-                tab1, tab2, tab3, tab4 = st.tabs(
-                    [
-                        "Sales",
-                        "Returns",
-                        "Reasons",
-                        "Locations"
-                    ]
-                )
-
-                with tab1:
-                    d = qdf(f"""
-                        SELECT
-                            o.order_date,
-                            SUM(oi.quantity) AS units,
-                            SUM(COALESCE(oi.item_price,0)) AS revenue
-                        FROM order_items oi
-                        JOIN orders o
-                            ON o.order_id = oi.order_id
-                        WHERE {ACTIVE}
-                          AND UPPER(COALESCE(oi.asin,'')) = UPPER(?)
-                        GROUP BY o.order_date
-                        ORDER BY o.order_date
-                    """, [str(selected)])
-
-                    if not d.empty:
-                        d["order_date"] = pd.to_datetime(
-                            d["order_date"],
-                            errors="coerce"
-                        )
-
-                        if PLOTLY_OK:
-                            st.plotly_chart(
-                                px.line(
-                                    d,
-                                    x="order_date",
-                                    y="revenue",
-                                    markers=True,
-                                    title="ASIN Sales Trend"
-                                ),
-                                width="stretch"
-                            )
-
-                            st.plotly_chart(
-                                px.bar(
-                                    d,
-                                    x="order_date",
-                                    y="units",
-                                    title="Units Sold by Date"
-                                ),
-                                width="stretch"
-                            )
-
-                        st.dataframe(
-                            d,
-                            width="stretch",
-                            hide_index=True
-                        )
-
-                    else:
-                        st.info(
-                            "No sales trend data found."
-                        )
-
-                with tab2:
-                    # Build the return-detail query only from columns that exist.
-                    return_cols = cols("returns")
-                    lower_returns = {c.lower(): c for c in return_cols}
-
-                    def rc(*names):
-                        for name in names:
-                            if name.lower() in lower_returns:
-                                return lower_returns[name.lower()]
-                        return None
-
-                    date_col = rc(
-                        "return_date", "return_request_date",
-                        "return_creation_date", "return_creation_timestamp",
-                        "return_date_time", "date", "authorization_date"
-                    )
-                    order_col = rc("order_id")
-                    sku_col = rc("sku", "merchant_sku")
-                    qty_col = rc("quantity", "return_quantity")
-                    reason_col = rc("reason", "return_reason")
-                    comment_col = rc("customer_comment", "customer_comments", "comment")
-                    disposition_col = rc("disposition", "resolution")
-
-                    select_parts = []
-                    for col, alias, fallback in [
-                        (date_col, "return_date", "NULL"),
-                        (order_col, "order_id", "NULL"),
-                        (sku_col, "sku", "NULL"),
-                        (qty_col, "quantity", "0"),
-                        (reason_col, "reason", "NULL"),
-                        (comment_col, "customer_comment", "NULL"),
-                        (disposition_col, "disposition", "NULL"),
-                    ]:
-                        select_parts.append(
-                            f'"{col}" AS {alias}' if col else f'{fallback} AS {alias}'
-                        )
-
-                    order_sql = f' ORDER BY "{date_col}" DESC' if date_col else ''
-                    rd = qdf(
-                        "SELECT " + ", ".join(select_parts) +
-                        " FROM returns WHERE UPPER(COALESCE(asin,'')) = UPPER(?)" +
-                        order_sql,
-                        [str(selected)]
-                    )
-
-                    if rd.empty:
-                        st.success(
-                            "No returns found for this ASIN."
-                        )
-                    else:
-                        st.dataframe(
-                            rd,
-                            width="stretch",
-                            hide_index=True
-                        )
-
-                        st.download_button(
-                            "Download ASIN Returns CSV",
-                            rd.to_csv(index=False).encode("utf-8"),
-                            f"{selected}_returns.csv",
-                            "text/csv"
-                        )
-
-                with tab3:
-                    reasons = qdf("""
-                        SELECT
-                            COALESCE(
-                                NULLIF(TRIM(reason),''),
-                                'Unknown'
-                            ) AS reason,
-                            SUM(quantity) AS return_units
-                        FROM returns
-                        WHERE UPPER(COALESCE(asin,'')) = UPPER(?)
-                        GROUP BY
-                            COALESCE(
-                                NULLIF(TRIM(reason),''),
-                                'Unknown'
-                            )
-                        ORDER BY SUM(quantity) DESC
-                    """, [str(selected)])
-
-                    if reasons.empty:
-                        st.info(
-                            "No return reasons found."
-                        )
-                    else:
-                        c1, c2 = st.columns(
-                            [1.2, 1]
-                        )
-
-                        with c1:
-                            if PLOTLY_OK:
-                                st.plotly_chart(
-                                    px.bar(
-                                        reasons,
-                                        x="return_units",
-                                        y="reason",
-                                        orientation="h",
-                                        title="Return Reasons"
-                                    ),
-                                    width="stretch"
-                                )
-
-                        with c2:
-                            st.dataframe(
-                                reasons,
-                                width="stretch",
-                                hide_index=True
-                            )
-
-                with tab4:
-                    loc, pc = asin_location_data(
-                        selected
-                    )
-
-                    if pc:
-                        if not loc.empty:
-                            st.dataframe(
-                                loc,
-                                width="stretch",
-                                hide_index=True
-                            )
-
-                            if PLOTLY_OK:
-                                st.plotly_chart(
-                                    px.bar(
-                                        loc.head(15)
-                                        .sort_values(
-                                            "return_units"
-                                        ),
-                                        x="return_units",
-                                        y="pincode",
-                                        orientation="h",
-                                        title="Top Return Pincodes"
-                                    ),
-                                    width="stretch"
-                                )
-                        else:
-                            st.info(
-                                "No pincode return data found "
-                                "for this ASIN."
-                            )
-                    else:
-                        st.warning(
-                            "Pincode is not stored in the current "
-                            "orders table. Once pincode is added to "
-                            "the database/import, this section will "
-                            "show return hotspots."
-                        )
-
-
-elif page == "Sales Intelligence":
-
-    st.subheader("Sales Intelligence")
-    st.caption("Sale Price = Amazon item-price only. item-tax is stored separately and is NOT added to Sale Price.")
-
-    d = asin_sales()
-
-    search = st.text_input(
-        "Search ASIN / SKU"
-    )
-
-    if search:
-        d = d[
-            d.astype(str)
-            .apply(
-                lambda x: x.str.contains(
-                    search,
-                    case=False,
-                    na=False
-                )
-            )
-            .any(axis=1)
-        ]
-
-    st.dataframe(
-        d,
-        width="stretch",
-        hide_index=True
-    )
-
-    st.download_button(
-        "Download Sales CSV",
-        d.to_csv(index=False).encode(),
-        "sales_analysis.csv",
-        "text/csv"
-    )
-
-
-elif page == "Return Intelligence":
-
-    st.subheader("Return Intelligence")
-
-    r = return_reasons()
-    a = return_asin()
-
-    c1, c2 = st.columns(2)
-
+        st.markdown('<div class="card"><div class="small-title">🍩 Order Status</div>',unsafe_allow_html=True)
+        if STATUS_COL:
+            os=qdf(f"SELECT CASE WHEN LOWER(TRIM({STATUS_COL})) LIKE '%cancel%' THEN 'Cancelled' WHEN LOWER(TRIM({STATUS_COL})) LIKE '%ship%' THEN 'Shipped' WHEN LOWER(TRIM({STATUS_COL})) LIKE '%return%' THEN 'Returned' ELSE 'Processing' END status,COUNT(DISTINCT order_id) orders FROM orders GROUP BY 1")
+        else: os=pd.DataFrame()
+        if not os.empty and PLOTLY_OK:
+            fig=px.pie(os,names="status",values="orders",hole=.62); fig.update_layout(height=320,margin=dict(l=5,r=5,t=10,b=10),showlegend=True)
+            chart(fig)
+        else: st.dataframe(os,width="stretch",hide_index=True)
+        st.markdown('</div>',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Product & Return Intelligence</div>',unsafe_allow_html=True)
+    a=asin_sales(); r=return_reasons();
+    c1,c2=st.columns([1.65,1])
     with c1:
-        st.markdown("### Return Reasons")
-
+        st.markdown('<div class="card"><div class="small-title">🏆 Top Selling ASINs</div>',unsafe_allow_html=True)
+        x=a.head(10).copy()
+        if not x.empty:
+            x=x.rename(columns={"asin":"ASIN","sku":"SKU","units":"Units Sold","revenue":"Revenue"}); x["Revenue"]=x["Revenue"].map(money); st.dataframe(x,width="stretch",hide_index=True)
+        else: st.info("No sales data.")
+        st.markdown('</div>',unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="card"><div class="small-title">↩️ Returns by Reason</div>',unsafe_allow_html=True)
         if not r.empty and PLOTLY_OK:
-            st.plotly_chart(
-                px.pie(
-                    r.head(12),
-                    names="reason",
-                    values="return_units",
-                    hole=.45
-                ),
-                width="stretch"
-            )
+            fig=px.bar(r.head(8).sort_values("return_units"),x="return_units",y="reason",orientation="h"); fig.update_layout(height=310,margin=dict(l=5,r=5,t=5,b=5),xaxis_title=None,yaxis_title=None)
+            chart(fig)
+        else: st.dataframe(r,width="stretch",hide_index=True)
+        st.markdown('</div>',unsafe_allow_html=True)
+    c1,c2,c3=st.columns(3)
+    for container,title,df in [(c1,"📊 Sales by Category",a.groupby(a.sku.fillna("Unknown").astype(str).str[:12]).units.sum().reset_index(name="units")),(c2,"↩️ Top Return ASINs",return_asin().head(8)),(c3,"📍 Orders by State",state_returns().head(8))]:
+        with container:
+            st.markdown(f'<div class="card"><div class="small-title">{title}</div>',unsafe_allow_html=True); st.dataframe(df,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+
+elif page=="ASIN Search":
+    st.markdown('<div class="hero"><h1>🔎 ASIN Search & Product Analysis</h1><p>Search an ASIN and view sales, returns, reasons and location hotspots.</p></div>',unsafe_allow_html=True)
+    q=st.text_input("Enter ASIN",value=global_search if global_search and global_search.upper().startswith("B") else "",placeholder="B0XXXXXXXX")
+    if q:
+        s=asin_sales(); m=s[s.asin.astype(str).str.upper()==q.strip().upper()] if not s.empty else pd.DataFrame()
+        if m.empty: st.error(f"No sales record found for ASIN: {q}")
         else:
-            st.dataframe(
-                r,
-                width="stretch",
-                hide_index=True
-            )
+            asin=m.iloc[0].asin; u=int(m.units.sum()); rv=float(m.revenue.sum()); rr=return_asin(); rr=rr[rr.asin.astype(str)==str(asin)]; ru=int(rr.return_units.sum()) if not rr.empty else 0; rate2=ru/u*100 if u else 0
+            st.markdown('<div class="section-title">Product Overview</div>',unsafe_allow_html=True)
+            for c,(l,v) in zip(st.columns(4),[("ASIN",asin),("Units Sold",f"{u:,}"),("Revenue",money(rv)),("Return Rate",f"{rate2:.2f}%")]): c.metric(l,v)
+            t1,t2,t3=st.tabs(["Sales","Return Reasons","Return Pincodes"])
+            with t1: st.dataframe(m,width="stretch",hide_index=True)
+            with t2:
+                z=return_reasons(asin)
+                if not z.empty and PLOTLY_OK: chart(px.bar(z.sort_values("return_units"),x="return_units",y="reason",orientation="h"))
+                else: st.dataframe(z,width="stretch",hide_index=True)
+            with t3:
+                z,pc=asin_location_data(asin)
+                if not z.empty and PLOTLY_OK: chart(px.bar(z.head(15).sort_values("return_units"),x="return_units",y="pincode",orientation="h"))
+                st.dataframe(z,width="stretch",hide_index=True)
+    else: st.info("Enter an ASIN to start the analysis.")
 
-    with c2:
-        st.markdown("### Top Return ASINs")
+elif page=="Sales Intelligence":
+    st.markdown('<div class="hero"><h1>Sales Intelligence</h1><p>Amazon item-price is used as Sale Price. Item tax is not added to Sale Price.</p></div>',unsafe_allow_html=True)
+    d=asin_sales(); search=st.text_input("Search ASIN / SKU",value=global_search)
+    if search and not d.empty: d=d[d.astype(str).apply(lambda col: col.str.contains(search,case=False,na=False)).any(axis=1)]
+    st.dataframe(d,width="stretch",hide_index=True); st.download_button("Download Sales CSV",d.to_csv(index=False).encode(),"sales_analysis.csv","text/csv")
 
-        if not a.empty and PLOTLY_OK:
-            st.plotly_chart(
-                px.bar(
-                    a.head(12).sort_values(
-                        "return_units"
-                    ),
-                    x="return_units",
-                    y="asin",
-                    orientation="h"
-                ),
-                width="stretch"
-            )
-        else:
-            st.dataframe(
-                a,
-                width="stretch",
-                hide_index=True
-            )
-
-    s = scorecard()
-
-    st.markdown("### Return Rate by ASIN")
-
-    st.dataframe(
-        s,
-        width="stretch",
-        hide_index=True
-    )
-
-
-elif page == "Location Intelligence":
-
-    st.subheader("Location Intelligence")
-
-    p, pc = locations()
-
-    if pc:
-        st.caption(
-            f"Return hotspots based on shipping pincode: orders.{pc}. Shipping city is shown when available."
-        )
-    else:
-        st.caption(
-            "Pincode is shown when it exists in the orders database."
-        )
-
-    c1, c2 = st.columns(2)
-
-    sr = state_returns()
-    cr = city_returns()
-
+elif page=="Return Intelligence":
+    st.markdown('<div class="hero"><h1>Return Intelligence</h1><p>Understand why products are returned and which ASINs require attention.</p></div>',unsafe_allow_html=True)
+    r=return_reasons(); a=return_asin(); c1,c2=st.columns(2)
     with c1:
-        st.markdown("### Returns by State")
-
-        if not sr.empty and PLOTLY_OK:
-            st.plotly_chart(
-                px.bar(
-                    sr.head(15).sort_values(
-                        "return_units"
-                    ),
-                    x="return_units",
-                    y="state",
-                    orientation="h"
-                ),
-                width="stretch"
-            )
-        else:
-            st.dataframe(
-                sr,
-                width="stretch",
-                hide_index=True
-            )
-
+        st.markdown('<div class="card"><div class="small-title">Returns by Reason</div>',unsafe_allow_html=True)
+        if not r.empty and PLOTLY_OK: chart(px.pie(r.head(12),names="reason",values="return_units",hole=.45))
+        st.dataframe(r,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
     with c2:
-        st.markdown("### Returns by City")
+        st.markdown('<div class="card"><div class="small-title">Top Return ASINs</div>',unsafe_allow_html=True)
+        if not a.empty and PLOTLY_OK: chart(px.bar(a.head(12).sort_values("return_units"),x="return_units",y="asin",orientation="h"))
+        st.dataframe(a,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+    st.subheader("ASIN Return Decision Scorecard"); st.dataframe(scorecard(),width="stretch",hide_index=True)
 
-        if not cr.empty and PLOTLY_OK:
-            st.plotly_chart(
-                px.bar(
-                    cr.head(15).sort_values(
-                        "return_units"
-                    ),
-                    x="return_units",
-                    y="city",
-                    orientation="h"
-                ),
-                width="stretch"
-            )
-        else:
-            st.dataframe(
-                cr,
-                width="stretch",
-                hide_index=True
-            )
+elif page=="Location Analysis":
+    st.markdown('<div class="hero"><h1>📍 Location Intelligence</h1><p>Identify states, cities and pincodes with higher return activity.</p></div>',unsafe_allow_html=True)
+    p,pc=locations(); sr=state_returns(); cr=city_returns(); c1,c2=st.columns(2)
+    with c1:
+        st.markdown('<div class="card"><div class="small-title">Returns by State</div>',unsafe_allow_html=True)
+        if not sr.empty and PLOTLY_OK: chart(px.bar(sr.head(15).sort_values("return_units"),x="return_units",y="state",orientation="h"))
+        st.dataframe(sr.head(20),width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="card"><div class="small-title">Returns by City</div>',unsafe_allow_html=True)
+        if not cr.empty and PLOTLY_OK: chart(px.bar(cr.head(15).sort_values("return_units"),x="return_units",y="city",orientation="h"))
+        st.dataframe(cr.head(20),width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+    st.subheader("Top Return Pincodes / Cities"); st.dataframe(p,width="stretch",hide_index=True)
 
-    st.markdown("### Top Return Pincodes / Cities")
-
-    if p.empty:
-        st.warning(
-            "Pincode is not stored in the orders table yet."
-        )
+elif page=="ASIN Scorecard":
+    st.markdown('<div class="hero"><h1>🏆 ASIN Product Decision Scorecard</h1><p>Prioritize products using sales volume and return-rate signals.</p></div>',unsafe_allow_html=True)
+    s=scorecard();
+    if s.empty: st.info("No sales/return data available.")
     else:
-        st.dataframe(
-            p,
-            width="stretch",
-            hide_index=True
-        )
+        a,b,c=st.columns(3); a.metric("High Return ASINs",int((s.decision=="🔴 High Return").sum())); b.metric("Watch ASINs",int((s.decision=="🟡 Watch").sum())); c.metric("Good ASINs",int((s.decision=="🟢 Good").sum())); st.dataframe(s,width="stretch",hide_index=True)
 
-
-elif page == "ASIN Scorecard":
-
-    st.subheader(
-        "ASIN Product Decision Scorecard"
-    )
-
-    s = scorecard()
-
-    if s.empty:
-        st.info(
-            "No sales/return data available."
-        )
-    else:
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric(
-            "High Return ASINs",
-            int(
-                (s["decision"] == "🔴 High Return").sum()
-            )
-        )
-
-        c2.metric(
-            "Watch ASINs",
-            int(
-                (s["decision"] == "🟡 Watch").sum()
-            )
-        )
-
-        c3.metric(
-            "Good ASINs",
-            int(
-                (s["decision"] == "🟢 Good").sum()
-            )
-        )
-
-        st.dataframe(
-            s,
-            width="stretch",
-            hide_index=True
-        )
-
-
-elif page == "Upload Center":
-
-    st.subheader(
-        "Amazon Report Upload Center"
-    )
-
-    typ = st.selectbox(
-        "Report Type",
-        ["Orders", "Returns"]
-    )
-
-    f = st.file_uploader(
-        "Upload Amazon report",
-        type=["txt", "tsv", "csv", "xlsx", "xls"]
-    )
-
-    if f and st.button(
-        "Import Report",
-        type="primary"
-    ):
+elif page=="Upload Center":
+    st.markdown('<div class="hero"><h1>☁ Upload Center</h1><p>Import Amazon Orders and Returns reports into the analytics database.</p></div>',unsafe_allow_html=True)
+    typ=st.selectbox("Report Type",["Orders","Returns"]); f=st.file_uploader("Choose Amazon report",type=["txt","tsv","csv","xlsx","xls"])
+    if f and st.button("Validate & Import",type="primary"):
         try:
-            result = ingest_report(
-                f,
-                typ
-            )
+            result=ingest_report(f,typ); st.success(result.get("message","Import completed.")); st.json(result); st.rerun()
+        except Exception as e: st.error(f"Import failed: {e}")
 
-            st.success(
-                result["message"]
-            )
+elif page=="Data Audit":
+    st.markdown('<div class="hero"><h1>Data Audit</h1><p>Database quality and import controls.</p></div>',unsafe_allow_html=True)
+    audit=pd.DataFrame([{"All Orders":scalar("SELECT COUNT(*) FROM orders"),"Active Orders":scalar(f"SELECT COUNT(*) FROM orders o WHERE {ACTIVE}"),"Cancelled Orders":cancelled,"Order Items":scalar("SELECT COUNT(*) FROM order_items"),"Returns":scalar("SELECT COUNT(*) FROM returns")}])
+    st.dataframe(audit,width="stretch",hide_index=True); st.info("Cancelled orders remain available for audit but are excluded from sales analytics.")
+    st.subheader("Database Columns"); st.json({"orders":ORDERS_COLS,"order_items":ITEM_COLS,"returns":RET_COLS})
 
-            st.json(result)
+elif page=="Orders":
+    st.markdown('<div class="hero"><h1>Orders</h1><p>Order-level operational view. Cancelled orders are retained for audit.</p></div>',unsafe_allow_html=True)
+    order_id=find_column("orders",["order_id"])
+    df=qdf("SELECT * FROM orders ORDER BY rowid DESC LIMIT 1000")
+    if global_search and not df.empty: df=df[df.astype(str).apply(lambda x:x.str.contains(global_search,case=False,na=False)).any(axis=1)]
+    st.dataframe(df,width="stretch",hide_index=True)
 
-            st.rerun()
-
-        except Exception as e:
-            st.error(
-                f"Import failed: {e}"
-            )
-
+elif page=="Returns":
+    st.markdown('<div class="hero"><h1>Returns</h1><p>Return requests, reasons, resolutions and reimbursement information.</p></div>',unsafe_allow_html=True)
+    df=qdf("SELECT * FROM returns ORDER BY rowid DESC LIMIT 1000")
+    if global_search and not df.empty: df=df[df.astype(str).apply(lambda x:x.str.contains(global_search,case=False,na=False)).any(axis=1)]
+    st.dataframe(df,width="stretch",hide_index=True)
 
 else:
-
-    st.subheader("Data Audit")
-
-    st.dataframe(
-        pd.DataFrame(
-            [{
-                "All Orders": scalar(
-                    "SELECT COUNT(*) FROM orders"
-                ),
-                "Active Orders": scalar(
-                    f"SELECT COUNT(*) FROM orders o WHERE {ACTIVE}"
-                ),
-                "Cancelled Orders": scalar(
-                    """
-                    SELECT COUNT(*)
-                    FROM orders o
-                    WHERE COALESCE(
-                        LOWER(TRIM(o.order_status)),
-                        ''
-                    ) LIKE '%cancel%'
-                    """
-                ),
-                "Order Items": scalar(
-                    "SELECT COUNT(*) FROM order_items"
-                ),
-                "Returns": scalar(
-                    "SELECT COUNT(*) FROM returns"
-                )
-            }]
-        ),
-        width="stretch",
-        hide_index=True
-    )
-
-    st.info(
-        "Cancelled orders remain available for audit "
-        "but are excluded from sales analytics."
-    )
+    st.markdown('<div class="hero"><h1>Reports</h1><p>Export operational analysis for management review.</p></div>',unsafe_allow_html=True)
+    s=scorecard(); loc,_=locations(); a=asin_sales()
+    for name,df in [("ASIN Scorecard",s),("Sales by ASIN",a),("Return Locations",loc)]:
+        st.subheader(name); st.download_button(f"Download {name} CSV",df.to_csv(index=False).encode(),name.lower().replace(" ","_")+".csv","text/csv"); st.dataframe(df.head(100),width="stretch",hide_index=True)
