@@ -84,6 +84,29 @@ def find_column(table, candidates):
         if c.lower() in low: return low[c.lower()]
     return None
 
+
+def ensure_return_analytics_columns():
+    """Upgrade an existing database without deleting any return data."""
+    con=connect()
+    try:
+        existing={r[1] for r in con.execute("PRAGMA table_info(returns)").fetchall()}
+        upgrades={
+            "return_request_status":"TEXT",
+            "refunded_amount":"REAL",
+            "safet_claim_id":"TEXT",
+            "safet_claim_state":"TEXT",
+            "safet_claim_reimbursement_amount":"REAL",
+        }
+        for name,typ in upgrades.items():
+            if name not in existing:
+                con.execute(f"ALTER TABLE returns ADD COLUMN {name} {typ}")
+        con.commit()
+    finally:
+        con.close()
+
+
+ensure_return_analytics_columns()
+
 ORDERS_COLS=cols("orders")
 ITEM_COLS=cols("order_items")
 RET_COLS=cols("returns")
@@ -96,7 +119,8 @@ def summary():
     rev=scalar(f"SELECT COALESCE(SUM(COALESCE(oi.item_price,0)),0) FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE}")
     orders=scalar(f"SELECT COUNT(DISTINCT o.order_id) FROM orders o WHERE {ACTIVE}")
     units=scalar(f"SELECT COALESCE(SUM(oi.quantity),0) FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE}")
-    returns=scalar("SELECT COALESCE(SUM(quantity),0) FROM returns")
+    rs=return_summary()
+    returns=int(rs.iloc[0]["return_units"]) if not rs.empty else 0
     cancelled=scalar(f"SELECT COUNT(*) FROM orders o WHERE COALESCE(LOWER(TRIM(o.{STATUS_COL or 'order_status'})),'') LIKE '%cancel%'") if STATUS_COL or 'order_status' in ORDERS_COLS else 0
     return float(rev),int(orders),int(units),int(returns),int(cancelled)
 
@@ -110,18 +134,112 @@ def asin_sales():
     return qdf(f"""SELECT oi.asin, oi.sku, COALESCE(SUM(oi.quantity),0) units, COALESCE(SUM(oi.item_price),0) revenue FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE} GROUP BY oi.asin,oi.sku ORDER BY revenue DESC""")
 
 
+def return_status_condition(alias="r"):
+    status_col=find_column("returns",["return_request_status","return_status","status"])
+    if not status_col:
+        return "1=1"
+    return f"COALESCE(LOWER(TRIM({alias}.{status_col})),'') NOT LIKE '%closed%'"
+
+
+def return_cte():
+    """Build the duplicate-safe return dataset used by every return analysis.
+
+    Rules:
+      * same Order ID + ASIN = one return
+      * closed return requests are excluded
+      * if duplicate rows exist, a non-zero refund is preferred and counted once
+      * Safe-T reimbursement is counted separately, once per Order ID + ASIN
+    """
+    refund_col=find_column("returns",["refunded_amount","refund_amount","refunded"])
+    safet_col=find_column("returns",["safet_claim_reimbursement_amount","safe_t_claim_reimbursement_amount","safet_reimbursement_amount"])
+    refund_expr=f"COALESCE(r.{refund_col},0)" if refund_col else "0"
+    safet_expr=f"COALESCE(r.{safet_col},0)" if safet_col else "0"
+    return f"""
+    WITH base AS (
+        SELECT
+            r.rowid AS _rowid,
+            r.*,
+            COALESCE({refund_expr},0) AS _refund,
+            COALESCE({safet_expr},0) AS _safet
+        FROM returns r
+        WHERE {return_status_condition('r')}
+    ), ranked AS (
+        SELECT
+            base.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(order_id,''), COALESCE(asin,'')
+                ORDER BY
+                    CASE WHEN _refund > 0 THEN 0 ELSE 1 END,
+                    CASE WHEN _safet > 0 THEN 0 ELSE 1 END,
+                    CASE WHEN return_date IS NULL OR return_date='' THEN 1 ELSE 0 END,
+                    return_date DESC,
+                    _rowid DESC
+            ) AS _rn,
+            MAX(_refund) OVER (
+                PARTITION BY COALESCE(order_id,''), COALESCE(asin,'')
+            ) AS _refund_selected,
+            MAX(_safet) OVER (
+                PARTITION BY COALESCE(order_id,''), COALESCE(asin,'')
+            ) AS _safet_selected
+        FROM base
+    )
+    """
+
+
 def return_asin():
-    return qdf("SELECT asin,sku,COALESCE(SUM(quantity),0) return_units FROM returns GROUP BY asin,sku ORDER BY SUM(quantity) DESC")
+    return qdf(return_cte()+"""
+        SELECT
+            COALESCE(asin,'') AS asin,
+            MAX(COALESCE(sku,'')) AS sku,
+            COUNT(*) AS return_units,
+            COALESCE(SUM(_refund_selected),0) AS refunded_amount,
+            COALESCE(SUM(_safet_selected),0) AS safet_claim_amount
+        FROM ranked
+        WHERE _rn=1
+        GROUP BY COALESCE(asin,'')
+        ORDER BY return_units DESC, refunded_amount DESC
+    """)
+
+
+def return_summary():
+    return qdf(return_cte()+"""
+        SELECT
+            COUNT(*) AS return_units,
+            COUNT(DISTINCT order_id) AS return_orders,
+            COALESCE(SUM(_refund_selected),0) AS refunded_amount,
+            COALESCE(SUM(_safet_selected),0) AS safet_claim_amount
+        FROM ranked
+        WHERE _rn=1
+    """)
+
+
+def safet_claims_by_asin():
+    return qdf(return_cte()+"""
+        SELECT
+            COALESCE(asin,'') AS asin,
+            MAX(COALESCE(sku,'')) AS sku,
+            COUNT(*) AS claim_returns,
+            COALESCE(SUM(_safet_selected),0) AS safet_claim_amount
+        FROM ranked
+        WHERE _rn=1 AND _safet_selected > 0
+        GROUP BY COALESCE(asin,'')
+        ORDER BY safet_claim_amount DESC
+    """)
 
 
 def return_reasons(asin=None):
     reason_col=find_column("returns",["reason","return_reason"])
     if not reason_col: return pd.DataFrame()
-    sql=f"SELECT COALESCE(NULLIF(TRIM({reason_col}),''),'Unknown') reason, COALESCE(SUM(quantity),0) return_units FROM returns"
+    sql=return_cte()+f"""
+        SELECT COALESCE(NULLIF(TRIM({reason_col}),''),'Unknown') AS reason,
+               COUNT(*) AS return_units
+        FROM ranked
+        WHERE _rn=1
+    """
     params=[]
     if asin:
-        sql+=" WHERE UPPER(COALESCE(asin,''))=UPPER(?)"; params=[str(asin)]
-    sql+=" GROUP BY COALESCE(NULLIF(TRIM("+reason_col+"),''),'Unknown') ORDER BY SUM(quantity) DESC"
+        sql+=" AND UPPER(COALESCE(asin,''))=UPPER(?)"; params=[str(asin)]
+    sql+=" GROUP BY COALESCE(NULLIF(TRIM("+reason_col+"),''),'Unknown') ORDER BY return_units DESC"
     return qdf(sql,params)
 
 
@@ -130,26 +248,67 @@ def locations():
     city=find_column("orders",["ship_city","shipping_city","city"])
     if not pc:return pd.DataFrame(),None
     if city:
-        return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown') city, COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode, SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown'),COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30"""),pc
-    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30"""),pc
+        sql=return_cte()+f"""
+            SELECT COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown') city,
+                   COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,
+                   COUNT(*) return_units
+            FROM ranked r JOIN orders o ON o.order_id=r.order_id
+            WHERE r._rn=1
+            GROUP BY COALESCE(NULLIF(TRIM(o.{city}),''),'Unknown'),COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+            ORDER BY return_units DESC LIMIT 30
+        """
+    else:
+        sql=return_cte()+f"""
+            SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,
+                   COUNT(*) return_units
+            FROM ranked r JOIN orders o ON o.order_id=r.order_id
+            WHERE r._rn=1
+            GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+            ORDER BY return_units DESC LIMIT 30
+        """
+    return qdf(sql),pc
 
 
 def state_returns():
     c=find_column("orders",["ship_state","shipping_state","state"])
     if not c:return pd.DataFrame()
-    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') state,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') ORDER BY SUM(r.quantity) DESC""")
+    return qdf(return_cte()+f"""
+        SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') state,
+               COUNT(*) return_units
+        FROM ranked r JOIN orders o ON o.order_id=r.order_id
+        WHERE r._rn=1
+        GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown')
+        ORDER BY return_units DESC
+    """)
 
 
 def city_returns():
     c=find_column("orders",["ship_city","shipping_city","city"])
     if not c:return pd.DataFrame()
-    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') city,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30""")
-
+    return qdf(return_cte()+f"""
+        SELECT COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown') city,
+               COUNT(*) return_units
+        FROM ranked r JOIN orders o ON o.order_id=r.order_id
+        WHERE r._rn=1
+        GROUP BY COALESCE(NULLIF(TRIM(o.{c}),''),'Unknown')
+        ORDER BY return_units DESC LIMIT 30
+    """)
 
 def scorecard():
     s=asin_sales(); r=return_asin()
     if s.empty:return pd.DataFrame()
-    d=s.merge(r,on=["asin","sku"],how="left"); d["return_units"]=pd.to_numeric(d["return_units"],errors="coerce").fillna(0)
+    # Return logic is ASIN-based because the duplicate rule is Order ID + ASIN.
+    # Aggregate sales to ASIN before calculating the return rate so multiple SKUs
+    # belonging to one ASIN do not split the return signal.
+    s2=s.groupby("asin",dropna=False,as_index=False).agg(
+        sku=("sku",lambda x: ", ".join(sorted(set(str(v) for v in x if str(v) not in ("", "nan")))[:3])),
+        units=("units","sum"),
+        revenue=("revenue","sum")
+    )
+    d=s2.merge(r.drop(columns=["sku"],errors="ignore"),on="asin",how="left")
+    d["return_units"]=pd.to_numeric(d["return_units"],errors="coerce").fillna(0)
+    d["refunded_amount"]=pd.to_numeric(d.get("refunded_amount",0),errors="coerce").fillna(0)
+    d["safet_claim_amount"]=pd.to_numeric(d.get("safet_claim_amount",0),errors="coerce").fillna(0)
     d["return_rate"]=(d.return_units/d.units.replace(0,pd.NA)*100).fillna(0)
     d["decision"]=d.apply(lambda x:"🔴 High Return" if x.return_rate>=15 and x.return_units>=3 else ("🟡 Watch" if x.return_rate>=8 and x.return_units>=2 else "🟢 Good"),axis=1)
     return d.sort_values(["return_rate","return_units"],ascending=False)
@@ -158,8 +317,14 @@ def scorecard():
 def asin_location_data(asin):
     pc=find_column("orders",["ship_postal_code","ship_pincode","ship_pin_code","postal_code","pincode","pin_code","zip"])
     if not pc:return pd.DataFrame(),None
-    return qdf(f"""SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,SUM(r.quantity) return_units FROM returns r JOIN orders o ON o.order_id=r.order_id WHERE UPPER(COALESCE(r.asin,''))=UPPER(?) GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') ORDER BY SUM(r.quantity) DESC LIMIT 30""",[str(asin)]),pc
-
+    return qdf(return_cte()+f"""
+        SELECT COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown') pincode,
+               COUNT(*) return_units
+        FROM ranked r JOIN orders o ON o.order_id=r.order_id
+        WHERE r._rn=1 AND UPPER(COALESCE(r.asin,''))=UPPER(?)
+        GROUP BY COALESCE(NULLIF(TRIM(o.{pc}),''),'Unknown')
+        ORDER BY return_units DESC LIMIT 30
+    """,[str(asin)]),pc
 
 def money(v): return f"₹{v:,.0f}"
 
@@ -264,16 +429,27 @@ elif page=="Sales Intelligence":
     st.dataframe(d,width="stretch",hide_index=True); st.download_button("Download Sales CSV",d.to_csv(index=False).encode(),"sales_analysis.csv","text/csv")
 
 elif page=="Return Intelligence":
-    st.markdown('<div class="hero"><h1>Return Intelligence</h1><p>Understand why products are returned and which ASINs require attention.</p></div>',unsafe_allow_html=True)
-    r=return_reasons(); a=return_asin(); c1,c2=st.columns(2)
+    st.markdown('<div class="hero"><h1>Return Intelligence</h1><p>Duplicate-safe returns, refunds and Safe-T reimbursement analysis.</p></div>',unsafe_allow_html=True)
+    rs=return_summary(); rr=return_reasons(); a=return_asin(); sc=safet_claims_by_asin()
+    total_returns=int(rs.iloc[0]["return_units"]) if not rs.empty else 0
+    total_refund=float(rs.iloc[0]["refunded_amount"]) if not rs.empty else 0
+    total_safet=float(rs.iloc[0]["safet_claim_amount"]) if not rs.empty else 0
+    c1,c2,c3=st.columns(3)
+    c1.metric("Unique Returns",f"{total_returns:,}")
+    c2.metric("Refunded Amount",money(total_refund))
+    c3.metric("Safe-T Claim Amount",money(total_safet))
+    st.info("Rule applied: same Order ID + ASIN = one return. Closed return requests are excluded. For duplicate rows, a non-zero refund is preferred and counted once. Safe-T reimbursement is tracked separately and counted once per Order ID + ASIN.")
+    c1,c2=st.columns(2)
     with c1:
         st.markdown('<div class="card"><div class="small-title">Returns by Reason</div>',unsafe_allow_html=True)
-        if not r.empty and PLOTLY_OK: chart(px.pie(r.head(12),names="reason",values="return_units",hole=.45))
-        st.dataframe(r,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+        if not rr.empty and PLOTLY_OK: chart(px.pie(rr.head(12),names="reason",values="return_units",hole=.45))
+        st.dataframe(rr,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card"><div class="small-title">Top Return ASINs</div>',unsafe_allow_html=True)
         if not a.empty and PLOTLY_OK: chart(px.bar(a.head(12).sort_values("return_units"),x="return_units",y="asin",orientation="h"))
         st.dataframe(a,width="stretch",hide_index=True); st.markdown('</div>',unsafe_allow_html=True)
+    st.subheader("Safe-T Claims by ASIN")
+    st.dataframe(sc,width="stretch",hide_index=True)
     st.subheader("ASIN Return Decision Scorecard"); st.dataframe(scorecard(),width="stretch",hide_index=True)
 
 elif page=="Location Analysis":
@@ -318,10 +494,24 @@ elif page=="Orders":
     st.dataframe(df,width="stretch",hide_index=True)
 
 elif page=="Returns":
-    st.markdown('<div class="hero"><h1>Returns</h1><p>Return requests, reasons, resolutions and reimbursement information.</p></div>',unsafe_allow_html=True)
-    df=qdf("SELECT * FROM returns ORDER BY rowid DESC LIMIT 1000")
+    st.markdown('<div class="hero"><h1>Returns</h1><p>Duplicate-safe return report. Same Order ID + ASIN is treated as one return.</p></div>',unsafe_allow_html=True)
+    df=qdf(return_cte()+"""
+        SELECT order_id, asin, MAX(COALESCE(sku,'')) sku,
+               1 AS return_count,
+               MAX(COALESCE(quantity,1)) source_quantity,
+               MAX(COALESCE(reason,'')) reason,
+               MAX(COALESCE(return_request_status,'')) return_request_status,
+               MAX(_refund_selected) refunded_amount,
+               MAX(_safet_selected) safet_claim_reimbursement_amount
+        FROM ranked
+        WHERE _rn=1
+        GROUP BY order_id, asin
+        ORDER BY MAX(_rowid) DESC
+        LIMIT 2000
+    """)
     if global_search and not df.empty: df=df[df.astype(str).apply(lambda x:x.str.contains(global_search,case=False,na=False)).any(axis=1)]
     st.dataframe(df,width="stretch",hide_index=True)
+    st.caption("Closed return requests are excluded. Refund and Safe-T amounts are not double-counted when Amazon provides duplicate rows for the same Order ID + ASIN.")
 
 else:
     st.markdown('<div class="hero"><h1>Reports</h1><p>Export operational analysis for management review.</p></div>',unsafe_allow_html=True)
