@@ -271,6 +271,7 @@ def ensure_return_columns(con):
     """
 
     columns = {
+        "return_request_status": "TEXT",
         "return_delivery_date": "TEXT",
         "seller_rma_id": "TEXT",
         "label_type": "TEXT",
@@ -684,6 +685,17 @@ def import_returns(df):
         True
     )
 
+    return_request_status = find(
+        df,
+        [
+            "return_request_status",
+            "return-request-status",
+            "return_status",
+            "return-status",
+            "status"
+        ]
+    )
+
     sku = find(
         df,
         [
@@ -927,6 +939,10 @@ def import_returns(df):
         ser(df, rd)
     )
 
+    w["return_request_status"] = text(
+        ser(df, return_request_status)
+    )
+
     w["sku"] = text(
         ser(df, sku)
     )
@@ -1123,6 +1139,7 @@ def import_returns(df):
         # old and upgraded schemas.
         # ----------------------------------------------------
         extra_fields = [
+            "return_request_status",
             "return_delivery_date",
             "seller_rma_id",
             "label_type",
