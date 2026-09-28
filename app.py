@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import pandas as pd
@@ -20,6 +21,15 @@ except Exception:
 
 st.set_page_config(page_title="Amazon Ops Analytics Pro", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
 init_db()
+
+
+def report_uploads_enabled():
+    setting = os.environ.get("ALLOW_REPORT_UPLOADS", "")
+    try:
+        setting = st.secrets.get("allow_report_uploads", setting)
+    except Exception:
+        pass
+    return str(setting).strip().lower() in {"1", "true", "yes", "on"}
 
 # -----------------------------
 # Professional UI
@@ -53,7 +63,8 @@ hr{border-color:#e8edf3}
 """, unsafe_allow_html=True)
 
 
-def qdf(sql, params=None):
+@st.cache_data(ttl=300)
+def cached_qdf(sql, params=None):
     con=connect()
     try:
         return pd.read_sql_query(sql, con, params=params or [])
@@ -61,13 +72,24 @@ def qdf(sql, params=None):
         con.close()
 
 
-def scalar(sql, params=None):
+@st.cache_data(ttl=300)
+def cached_scalar(sql, params=None):
     con=connect()
     try:
         row=con.execute(sql, params or []).fetchone()
         return row[0] if row and row[0] is not None else 0
     finally:
         con.close()
+
+
+def qdf(sql, params=None):
+    safe_params = tuple(params) if isinstance(params, list) else params
+    return cached_qdf(sql, safe_params)
+
+
+def scalar(sql, params=None):
+    safe_params = tuple(params) if isinstance(params, list) else params
+    return cached_scalar(sql, safe_params)
 
 
 def cols(table):
@@ -125,11 +147,13 @@ def summary():
     return float(rev),int(orders),int(units),int(returns),int(cancelled)
 
 
+@st.cache_data(ttl=300)
 def sales_daily():
     if not ORDER_DATE_COL: return pd.DataFrame()
     return qdf(f"""SELECT o.{ORDER_DATE_COL} order_date, COUNT(DISTINCT o.order_id) orders, COALESCE(SUM(oi.quantity),0) units, COALESCE(SUM(oi.item_price),0) revenue FROM orders o JOIN order_items oi ON o.order_id=oi.order_id WHERE {ACTIVE} GROUP BY o.{ORDER_DATE_COL} ORDER BY o.{ORDER_DATE_COL}""")
 
 
+@st.cache_data(ttl=300)
 def asin_sales():
     return qdf(f"""SELECT oi.asin, oi.sku, COALESCE(SUM(oi.quantity),0) units, COALESCE(SUM(oi.item_price),0) revenue FROM order_items oi JOIN orders o ON o.order_id=oi.order_id WHERE {ACTIVE} GROUP BY oi.asin,oi.sku ORDER BY revenue DESC""")
 
@@ -334,7 +358,10 @@ def chart(fig):
 # Sidebar
 with st.sidebar:
     st.markdown('<div class="brand"><div class="brand-row"><div class="brand-logo">📦</div><div><div class="brand-title">Amazon Ops</div><div class="brand-sub">Analytics Pro</div></div></div></div>',unsafe_allow_html=True)
-    page=st.radio("Module",["Dashboard","Orders","Returns","ASIN Search","Sales Intelligence","Return Intelligence","Location Analysis","ASIN Scorecard","Upload Center","Data Audit","Reports"],label_visibility="collapsed")
+    modules=["Dashboard","Orders","Returns","ASIN Search","Sales Intelligence","Return Intelligence","Location Analysis","ASIN Scorecard","Data Audit","Reports"]
+    if report_uploads_enabled():
+        modules.insert(-2,"Upload Center")
+    page=st.radio("Module",modules,label_visibility="collapsed")
     st.markdown('<div style="margin-top:30px;padding:15px;border-radius:13px;background:rgba(255,255,255,.08)"><b>Keep Growing</b><br><span style="font-size:12px;opacity:.75">Data Driven<br>Better Decisions</span></div>',unsafe_allow_html=True)
 
 # top bar
@@ -346,11 +373,12 @@ with t1:
 with t2:
     st.date_input("Date range",value=(pd.Timestamp("2026-08-01").date(),pd.Timestamp("2026-08-31").date()),label_visibility="collapsed")
 with t3:
-    st.markdown('<div style="text-align:right;padding-top:7px;font-weight:700;color:#24364f">YK &nbsp; Yogesh Kumar<br><span style="font-size:11px;color:#8492a6;font-weight:400">Admin</span></div>',unsafe_allow_html=True)
+    st.markdown('<div style="text-align:right;padding-top:7px;font-weight:700;color:#24364f">Public Demo<br><span style="font-size:11px;color:#8492a6;font-weight:400">Read-only</span></div>',unsafe_allow_html=True)
 st.markdown('</div>',unsafe_allow_html=True)
 
 if page=="Dashboard":
-    st.markdown('<div class="hero"><h1>Welcome Back,</h1><h1>Amazon Ops Analytics Pro</h1><p>Sales intelligence • Return intelligence • ASIN performance • Location analysis</p></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Amazon Ops Analytics Pro</h1><p>Public operations snapshot • Sales intelligence • Return intelligence • ASIN performance • Location analysis</p></div>',unsafe_allow_html=True)
+    st.caption("This public dashboard is optimized for executive review and quick operational decision-making across revenue, returns, ASIN health, and geographic risk.")
     st.markdown('<div class="section-title">Executive Overview</div>',unsafe_allow_html=True)
     vals=[("🛒","Total Revenue",money(rev),"Non-cancelled orders","blue"),("📦","Valid Orders",f"{orders:,}","Cancelled excluded","green"),("🛍️","Units Sold",f"{units:,}","Non-cancelled orders","purple"),("↩️","Return Units",f"{returns:,}","Imported returns","orange"),("%","Return Rate",f"{rate:.2f}%","Returns ÷ sold units","pink")]
     for c,(ic,l,v,n,col) in zip(st.columns(5),vals):
@@ -473,12 +501,15 @@ elif page=="ASIN Scorecard":
         a,b,c=st.columns(3); a.metric("High Return ASINs",int((s.decision=="🔴 High Return").sum())); b.metric("Watch ASINs",int((s.decision=="🟡 Watch").sum())); c.metric("Good ASINs",int((s.decision=="🟢 Good").sum())); st.dataframe(s,width="stretch",hide_index=True)
 
 elif page=="Upload Center":
-    st.markdown('<div class="hero"><h1>☁ Upload Center</h1><p>Import Amazon Orders and Returns reports into the analytics database.</p></div>',unsafe_allow_html=True)
-    typ=st.selectbox("Report Type",["Orders","Returns"]); f=st.file_uploader("Choose Amazon report",type=["txt","tsv","csv","xlsx","xls"])
-    if f and st.button("Validate & Import",type="primary"):
-        try:
-            result=ingest_report(f,typ); st.success(result.get("message","Import completed.")); st.json(result); st.rerun()
-        except Exception as e: st.error(f"Import failed: {e}")
+    if not report_uploads_enabled():
+        st.error("Report uploads are disabled in this deployment.")
+    else:
+        st.markdown('<div class="hero"><h1>☁ Upload Center</h1><p>Import Amazon Orders and Returns reports into the analytics database.</p></div>',unsafe_allow_html=True)
+        typ=st.selectbox("Report Type",["Orders","Returns"]); f=st.file_uploader("Choose Amazon report",type=["txt","tsv","csv","xlsx","xls"])
+        if f and st.button("Validate & Import",type="primary"):
+            try:
+                result=ingest_report(f,typ); st.success(result.get("message","Import completed.")); st.json(result); st.rerun()
+            except Exception as e: st.error(f"Import failed: {e}")
 
 elif page=="Data Audit":
     st.markdown('<div class="hero"><h1>Data Audit</h1><p>Database quality and import controls.</p></div>',unsafe_allow_html=True)
