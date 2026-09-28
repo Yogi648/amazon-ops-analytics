@@ -3,7 +3,7 @@ import io
 import re
 import pandas as pd
 
-from db import connect, init_db
+from db import connect, init_db, table_columns as db_table_columns
 
 
 # ============================================================
@@ -175,7 +175,7 @@ def dates(s):
         if pd.isna(value):
             result.append(None)
         else:
-            result.append(value.date())
+            result.append(value.date().isoformat())
 
     return pd.Series(
         result,
@@ -221,12 +221,7 @@ def sqlite_value(value):
 # ============================================================
 
 def table_columns(con, table):
-    return {
-        row[1]
-        for row in con.execute(
-            f"PRAGMA table_info({table})"
-        ).fetchall()
-    }
+    return db_table_columns(con, table)
 
 
 def add_column_if_missing(con, table, column, sql_type="TEXT"):
@@ -526,7 +521,7 @@ def import_orders(df):
         ):
             con.execute(
                 """
-                INSERT OR REPLACE INTO orders
+                INSERT INTO orders
                 (
                     order_id,
                     order_date,
@@ -537,6 +532,13 @@ def import_orders(df):
                     ship_postal_code
                 )
                 VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    order_date=excluded.order_date,
+                    order_status=excluded.order_status,
+                    sales_channel=excluded.sales_channel,
+                    ship_state=excluded.ship_state,
+                    ship_city=excluded.ship_city,
+                    ship_postal_code=excluded.ship_postal_code
                 """,
                 [
                     sqlite_value(r.order_id),
@@ -568,8 +570,7 @@ def import_orders(df):
             "currency",
         ]
 
-        # If the existing schema has exactly these fields, use
-        # the original INSERT OR REPLACE behavior.
+        # Use the portable conflict-update behavior when this schema is present.
         if all(
             c in order_item_columns
             for c in required_item_columns
@@ -577,7 +578,7 @@ def import_orders(df):
             for r in w.itertuples(index=False):
                 con.execute(
                     """
-                    INSERT OR REPLACE INTO order_items
+                    INSERT INTO order_items
                     (
                         order_id,
                         order_item_key,
@@ -590,6 +591,14 @@ def import_orders(df):
                         currency
                     )
                     VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(order_id,order_item_key) DO UPDATE SET
+                        order_date=excluded.order_date,
+                        sku=excluded.sku,
+                        asin=excluded.asin,
+                        quantity=excluded.quantity,
+                        item_price=excluded.item_price,
+                        item_tax=excluded.item_tax,
+                        currency=excluded.currency
                     """,
                     [
                         sqlite_value(r.order_id),
@@ -1106,7 +1115,7 @@ def import_returns(df):
         for r in w.itertuples(index=False):
             con.execute(
                 """
-                INSERT OR REPLACE INTO returns
+                INSERT INTO returns
                 (
                     return_id,
                     order_id,
@@ -1119,6 +1128,15 @@ def import_returns(df):
                     disposition
                 )
                 VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(return_id) DO UPDATE SET
+                    order_id=excluded.order_id,
+                    return_date=excluded.return_date,
+                    sku=excluded.sku,
+                    asin=excluded.asin,
+                    quantity=excluded.quantity,
+                    reason=excluded.reason,
+                    customer_comment=excluded.customer_comment,
+                    disposition=excluded.disposition
                 """,
                 [
                     sqlite_value(r.return_id),

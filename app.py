@@ -9,7 +9,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from db import connect, init_db
+from db import (
+    configure_database,
+    connect,
+    init_db,
+    persistent_database_configured,
+    table_columns,
+)
 from ingest import ingest_report
 
 try:
@@ -20,16 +26,39 @@ except Exception:
     PLOTLY_OK = False
 
 st.set_page_config(page_title="Amazon Ops Analytics Pro", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
+def secret_value(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+configure_database(os.environ.get("DATABASE_URL") or secret_value("database_url"))
 init_db()
 
 
+def oidc_configured():
+    auth_config = secret_value("auth", {})
+    required = ("redirect_uri", "cookie_secret", "client_id", "client_secret", "server_metadata_url")
+    return all(auth_config.get(key) for key in required)
+
+
+def authorized_admin():
+    if not oidc_configured() or not st.user.is_logged_in:
+        return False
+    allowed_emails = secret_value("admin_emails", [])
+    if isinstance(allowed_emails, str):
+        allowed_emails = [email.strip() for email in allowed_emails.split(",")]
+    email = str(getattr(st.user, "email", "")).strip().lower()
+    return bool(email and email in {str(value).strip().lower() for value in allowed_emails})
+
+
+IS_AUTHORIZED_ADMIN = authorized_admin()
+IS_ADMIN = IS_AUTHORIZED_ADMIN and persistent_database_configured()
+
+
 def report_uploads_enabled():
-    setting = os.environ.get("ALLOW_REPORT_UPLOADS", "")
-    try:
-        setting = st.secrets.get("allow_report_uploads", setting)
-    except Exception:
-        pass
-    return str(setting).strip().lower() in {"1", "true", "yes", "on"}
+    return IS_ADMIN
 
 # -----------------------------
 # Professional UI
@@ -67,7 +96,9 @@ hr{border-color:#e8edf3}
 def cached_qdf(sql, params=None):
     con=connect()
     try:
-        return pd.read_sql_query(sql, con, params=params or [])
+        result=con.execute(sql, params or [])
+        names=[column.name if hasattr(column,"name") else column[0] for column in result.description]
+        return pd.DataFrame(result.fetchall(), columns=names)
     finally:
         con.close()
 
@@ -95,7 +126,7 @@ def scalar(sql, params=None):
 def cols(table):
     con=connect()
     try:
-        return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+        return sorted(table_columns(con, table))
     finally:
         con.close()
 
@@ -111,7 +142,7 @@ def ensure_return_analytics_columns():
     """Upgrade an existing database without deleting any return data."""
     con=connect()
     try:
-        existing={r[1] for r in con.execute("PRAGMA table_info(returns)").fetchall()}
+        existing=table_columns(con,"returns")
         upgrades={
             "return_request_status":"TEXT",
             "refunded_amount":"REAL",
@@ -181,7 +212,7 @@ def return_cte():
     return f"""
     WITH base AS (
         SELECT
-            r.rowid AS _rowid,
+            r.return_id AS _rowid,
             r.*,
             COALESCE({refund_expr},0) AS _refund,
             COALESCE({safet_expr},0) AS _safet
@@ -358,11 +389,30 @@ def chart(fig):
 # Sidebar
 with st.sidebar:
     st.markdown('<div class="brand"><div class="brand-row"><div class="brand-logo">📦</div><div><div class="brand-title">Amazon Ops</div><div class="brand-sub">Analytics Pro</div></div></div></div>',unsafe_allow_html=True)
-    modules=["Dashboard","Orders","Returns","ASIN Search","Sales Intelligence","Return Intelligence","Location Analysis","ASIN Scorecard","Data Audit","Reports"]
-    if report_uploads_enabled():
-        modules.insert(-2,"Upload Center")
+    modules=["Dashboard"]
+    if IS_ADMIN:
+        modules += ["Orders","Returns","ASIN Search","Sales Intelligence","Return Intelligence","Location Analysis","ASIN Scorecard","Upload Center","Data Audit","Reports"]
+        if st.button("Sign out"):
+            st.logout()
+    elif IS_AUTHORIZED_ADMIN:
+        st.caption("Configure the persistent database to open private tools.")
+        if st.button("Sign out"):
+            st.logout()
+    elif oidc_configured():
+        if st.user.is_logged_in:
+            st.caption("This account is not on the admin allowlist.")
+            if st.button("Sign out"):
+                st.logout()
+        elif st.button("Admin sign in"):
+            st.login()
+    else:
+        st.caption("Public aggregate view")
     page=st.radio("Module",modules,label_visibility="collapsed")
     st.markdown('<div style="margin-top:30px;padding:15px;border-radius:13px;background:rgba(255,255,255,.08)"><b>Keep Growing</b><br><span style="font-size:12px;opacity:.75">Data Driven<br>Better Decisions</span></div>',unsafe_allow_html=True)
+
+if page != "Dashboard" and not IS_ADMIN:
+    st.error("Private dashboard tools require an authorized admin sign-in.")
+    st.stop()
 
 # top bar
 rev,orders,units,returns,cancelled=summary(); rate=returns/units*100 if units else 0
@@ -373,7 +423,8 @@ with t1:
 with t2:
     st.date_input("Date range",value=(pd.Timestamp("2026-08-01").date(),pd.Timestamp("2026-08-31").date()),label_visibility="collapsed")
 with t3:
-    st.markdown('<div style="text-align:right;padding-top:7px;font-weight:700;color:#24364f">Public Demo<br><span style="font-size:11px;color:#8492a6;font-weight:400">Read-only</span></div>',unsafe_allow_html=True)
+    identity="Admin Workspace<br><span style=\"font-size:11px;color:#8492a6;font-weight:400\">Private data access</span>" if IS_ADMIN else "Public Dashboard<br><span style=\"font-size:11px;color:#8492a6;font-weight:400\">Aggregate view</span>"
+    st.markdown(f'<div style="text-align:right;padding-top:7px;font-weight:700;color:#24364f">{identity}</div>',unsafe_allow_html=True)
 st.markdown('</div>',unsafe_allow_html=True)
 
 if page=="Dashboard":
@@ -506,13 +557,13 @@ elif page=="ASIN Scorecard":
 
 elif page=="Upload Center":
     if not report_uploads_enabled():
-        st.error("Report uploads are disabled in this deployment.")
+        st.error("Private report uploads require an authorized admin and a configured persistent database.")
     else:
         st.markdown('<div class="hero"><h1>☁ Upload Center</h1><p>Import Amazon Orders and Returns reports into the analytics database.</p></div>',unsafe_allow_html=True)
         typ=st.selectbox("Report Type",["Orders","Returns"]); f=st.file_uploader("Choose Amazon report",type=["txt","tsv","csv","xlsx","xls"])
         if f and st.button("Validate & Import",type="primary"):
             try:
-                result=ingest_report(f,typ); st.success(result.get("message","Import completed.")); st.json(result); st.rerun()
+                result=ingest_report(f,typ); st.cache_data.clear(); st.success(result.get("message","Import completed.")); st.json(result); st.rerun()
             except Exception as e: st.error(f"Import failed: {e}")
 
 elif page=="Data Audit":
@@ -524,7 +575,7 @@ elif page=="Data Audit":
 elif page=="Orders":
     st.markdown('<div class="hero"><h1>Orders</h1><p>Order-level operational view. Cancelled orders are retained for audit.</p></div>',unsafe_allow_html=True)
     order_id=find_column("orders",["order_id"])
-    df=qdf("SELECT * FROM orders ORDER BY rowid DESC LIMIT 1000")
+    df=qdf("SELECT * FROM orders ORDER BY order_date DESC, order_id DESC LIMIT 1000")
     if global_search and not df.empty: df=df[df.astype(str).apply(lambda x:x.str.contains(global_search,case=False,na=False)).any(axis=1)]
     st.dataframe(df,width="stretch",hide_index=True)
 
@@ -541,7 +592,7 @@ elif page=="Returns":
         FROM ranked
         WHERE _rn=1
         GROUP BY order_id, asin
-        ORDER BY MAX(_rowid) DESC
+        ORDER BY MAX(return_date) DESC, MAX(_rowid) DESC
         LIMIT 2000
     """)
     if global_search and not df.empty: df=df[df.astype(str).apply(lambda x:x.str.contains(global_search,case=False,na=False)).any(axis=1)]

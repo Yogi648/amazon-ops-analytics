@@ -1,6 +1,7 @@
 duckdb
 pandas
-streamlit
+streamlit[auth]>=1.57.0
+psycopg[binary]>=3.2
 plotly
 python-dotenv
 openpyxl

@@ -9,15 +9,40 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Upload access
+Local development uses SQLite. For durable hosted data, configure a dedicated
+Supabase Postgres project for Amazon Ops; do not reuse PriceFlow's database.
+The app creates and upgrades its tables when it connects. Uploaded report rows
+are stored in Postgres; the original CSV/XLS/XLSX file is parsed in memory and
+discarded after import.
 
-Report uploads are disabled by default. To enable them for a trusted local
-instance, set `$env:ALLOW_REPORT_UPLOADS = "true"` before starting Streamlit.
-On Streamlit Community Cloud, the equivalent setting is
-`allow_report_uploads = true` in the app's secrets. Do not enable uploads on an
-anonymous public deployment.
+## Configure hosted storage and sign-in
 
-Anyone who can open a public deployment can see its dashboard data. Use only
-synthetic or sanitized data there; never upload Seller Central exports or
-customer information to an anonymous app. A real seller dashboard needs
-authentication and access-controlled, durable storage.
+In Supabase, create a separate project and copy its Postgres session-pooler
+connection string. In Streamlit Community Cloud, open the app's **Settings >
+Secrets** and add the following TOML, replacing every placeholder. Register the
+Streamlit redirect URL with your OIDC provider (Google is shown here).
+
+```toml
+database_url = "postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
+admin_emails = ["your-admin-email@example.com"]
+
+[auth]
+redirect_uri = "https://YOUR-APP.streamlit.app/oauth2callback"
+cookie_secret = "GENERATE-A-LONG-RANDOM-SECRET"
+client_id = "YOUR-OIDC-CLIENT-ID"
+client_secret = "YOUR-OIDC-CLIENT-SECRET"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+```
+
+The signed-in OIDC email must be in `admin_emails`. Keep secrets only in
+Streamlit's secret store or a local `.streamlit/secrets.toml` (already ignored
+by Git); never put database credentials in source code or browser JavaScript.
+Private pages and uploads stay unavailable until both Postgres and OIDC admin
+configuration are present.
+
+## Data exposure
+
+Anonymous visitors can see only the aggregate dashboard. Order-level, return-
+level, search, audit, and upload tools require an authorized admin sign-in.
+Never publish raw exports or customer comments. The uploader stores normalized
+rows in the private database and does not archive original report files.
