@@ -379,6 +379,10 @@ st.markdown('</div>',unsafe_allow_html=True)
 if page=="Dashboard":
     st.markdown('<div class="hero"><h1>Amazon Ops Analytics Pro</h1><p>Public operations snapshot • Sales intelligence • Return intelligence • ASIN performance • Location analysis</p></div>',unsafe_allow_html=True)
     st.caption("This public dashboard is optimized for executive review and quick operational decision-making across revenue, returns, ASIN health, and geographic risk.")
+    if scalar("SELECT (SELECT COUNT(*) FROM orders) + (SELECT COUNT(*) FROM order_items) + (SELECT COUNT(*) FROM returns)") == 0:
+        st.info("No report data is loaded in this public demo. KPIs are hidden so an empty database is not mistaken for real business performance.")
+        st.caption("This instance is read-only. Do not upload Seller Central exports or customer data to this public dashboard.")
+        st.stop()
     st.markdown('<div class="section-title">Executive Overview</div>',unsafe_allow_html=True)
     vals=[("🛒","Total Revenue",money(rev),"Non-cancelled orders","blue"),("📦","Valid Orders",f"{orders:,}","Cancelled excluded","green"),("🛍️","Units Sold",f"{units:,}","Non-cancelled orders","purple"),("↩️","Return Units",f"{returns:,}","Imported returns","orange"),("%","Return Rate",f"{rate:.2f}%","Returns ÷ sold units","pink")]
     for c,(ic,l,v,n,col) in zip(st.columns(5),vals):
